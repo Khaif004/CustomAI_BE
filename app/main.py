@@ -1,5 +1,5 @@
 """
-Main FastAPI application
+Main FastAPI application - Simple Chat Agent Version
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,14 +39,12 @@ async def startup_event():
     """Initialize services on startup"""
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"Debug mode: {settings.debug}")
-    # TODO: Initialize agents, knowledge base, etc.
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
     logger.info("Shutting down application")
-    # TODO: Cleanup resources
 
 
 @app.get("/")
@@ -72,7 +70,6 @@ async def health_check():
 @app.get("/ready")
 async def readiness_check():
     """Readiness check endpoint"""
-    # TODO: Add actual readiness checks
     return {
         "status": "ready",
         "checks": {
@@ -81,6 +78,23 @@ async def readiness_check():
             "vector_store": "not_configured"
         }
     }
+
+
+try:
+    from app.api import chat
+    app.include_router(chat.router)
+    logger.info("✓ Chat API routes registered")
+except Exception as e:
+    logger.warning(f"⚠️  Chat routes not available: {str(e)}")
+    logger.debug(f"Full error: {e}", exc_info=True)
+
+try:
+    from app.api import auth
+    app.include_router(auth.router)
+    logger.info("✓ Auth API routes registered")
+except Exception as e:
+    logger.error(f"Failed to register auth routes: {str(e)}")
+    logger.exception(e)
 
 
 if __name__ == "__main__":

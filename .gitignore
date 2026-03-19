@@ -35,6 +35,7 @@ wheels/
 *.swo
 *~
 .DS_Store
+/data
 
 # Testing
 .pytest_cache/
