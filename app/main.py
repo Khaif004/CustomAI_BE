@@ -1,22 +1,12 @@
-"""
-Main FastAPI application - Simple Chat Agent Version
-"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 import logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Get settings
 settings = get_settings()
 
-# Initialize FastAPI app
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
@@ -24,7 +14,6 @@ app = FastAPI(
     debug=settings.debug
 )
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -36,72 +25,39 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup"""
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
-    logger.info(f"Debug mode: {settings.debug}")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
     logger.info("Shutting down application")
 
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
-    return {
-        "message": f"Welcome to {settings.app_name}",
-        "version": settings.app_version,
-        "status": "running"
-    }
+    return {"message": f"Welcome to {settings.app_name}", "version": settings.app_version, "status": "running"}
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": settings.app_name,
-        "version": settings.app_version
-    }
-
-
-@app.get("/ready")
-async def readiness_check():
-    """Readiness check endpoint"""
-    return {
-        "status": "ready",
-        "checks": {
-            "database": "not_configured",
-            "llm": "not_configured",
-            "vector_store": "not_configured"
-        }
-    }
+    return {"status": "healthy", "service": settings.app_name, "version": settings.app_version}
 
 
 try:
     from app.api import chat
     app.include_router(chat.router)
-    logger.info("✓ Chat API routes registered")
+    logger.info("Chat API routes registered")
 except Exception as e:
-    logger.warning(f"⚠️  Chat routes not available: {str(e)}")
-    logger.debug(f"Full error: {e}", exc_info=True)
+    logger.warning(f"Chat routes not available: {e}")
 
 try:
     from app.api import auth
     app.include_router(auth.router)
-    logger.info("✓ Auth API routes registered")
+    logger.info("Auth API routes registered")
 except Exception as e:
-    logger.error(f"Failed to register auth routes: {str(e)}")
-    logger.exception(e)
+    logger.error(f"Failed to register auth routes: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug
-    )
+    uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=settings.debug)

@@ -1,4 +1,1 @@
-"""
-Utilities module
-Helper functions and utilities
-"""
+# Utilities module
