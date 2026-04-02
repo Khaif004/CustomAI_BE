@@ -45,6 +45,13 @@ class MockChatAgent:
 
         return {"response": response_text, "model": "mock-agent", "response_time": response_time}
 
+    async def stream_response(self, message: str, history: Optional[List[Dict[str, str]]] = None):
+        result = await self.get_response(message, history)
+        words = result["response"].split(" ")
+        for i, word in enumerate(words):
+            yield word if i == 0 else " " + word
+            await asyncio.sleep(0.04)
+
     def get_status(self) -> Dict[str, Any]:
         return {
             "agent_type": "mock",

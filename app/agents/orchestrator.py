@@ -46,18 +46,14 @@ class MultiAgentOrchestrator:
 
             conversation_history = [{"role": m.role, "content": m.content} for m in conversation.messages[:-1]]
 
-            # Route through supervisor
             supervision_result = await self.supervisor.process_query(
                 query, context={"project": project_context}, conversation_history=conversation_history)
             selected_agents = supervision_result.get("selected_agents", ["developer_helper"])
 
-            # Process with selected agents
             agent_responses = await self._process_with_agents(query, selected_agents, conversation_history)
 
-            # Aggregate results
             final_response = await self._aggregate_responses(query, agent_responses, supervision_result)
 
-            # Save assistant message
             assistant_message = ChatMessage(
                 role="assistant", content=final_response.get("response", ""),
                 timestamp=datetime.utcnow(), agent_type=AgentType.SUPERVISOR,

@@ -4,25 +4,21 @@ from typing import List, Optional
 
 
 class Settings(BaseSettings):
-    # Application
     app_name: str = "Joule Replacement"
     app_version: str = "0.1.0"
     debug: bool = True
     log_level: str = "INFO"
     use_mock_agent: bool = False
 
-    # Server
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # LLM Configuration
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-3.5-turbo"
     openai_temperature: float = 0.7
     openai_max_tokens: int = 2048
 
-    # SAP AI Core
-    llm_provider: str = "openai"  # "openai", "sap_ai_core", "mock"
+    llm_provider: str = "openai"
     sap_aicore_url: Optional[str] = None
     sap_aicore_auth_url: Optional[str] = None
     sap_aicore_client_id: Optional[str] = None
@@ -30,20 +26,17 @@ class Settings(BaseSettings):
     sap_aicore_model_id: str = "gpt-4o"
     sap_aicore_deployment_id: str = "default"
 
-    # Security
     jwt_secret_key: str = "dev-secret-key-change-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     token_refresh_days: int = 7
 
-    # CORS
     allowed_origins: str = "http://localhost:3000,http://localhost:5173"
 
     @property
     def cors_origins(self) -> List[str]:
         return [origin.strip() for origin in self.allowed_origins.split(",")]
 
-    # Database
     database_url: Optional[str] = None
     db_host: Optional[str] = None
     db_port: int = 5432

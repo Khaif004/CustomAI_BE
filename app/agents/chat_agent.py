@@ -102,6 +102,23 @@ When helping with code:
             logger.error(f"Error in ChatAgent.get_response: {e}", exc_info=True)
             raise
 
+    async def stream_response(self, message: str, history: List[Dict[str, str]] = None):
+        self.total_requests += 1
+        formatted_history = []
+        if history:
+            for msg in history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    formatted_history.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    formatted_history.append(AIMessage(content=content))
+                elif role == "system":
+                    formatted_history.append(SystemMessage(content=content))
+
+        async for chunk in self.chain.astream({"input": message, "history": formatted_history}):
+            yield chunk
+
     def get_status(self) -> Dict[str, Any]:
         return {
             "agent_type": "chat",
