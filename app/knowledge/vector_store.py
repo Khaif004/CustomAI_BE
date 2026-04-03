@@ -3,7 +3,7 @@ import os
 from typing import List, Dict, Any, Optional
 from langchain_community.vectorstores import Chroma, FAISS
 from langchain_openai import OpenAIEmbeddings
-from langchain.schema import Document
+from langchain_core.documents import Document
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)

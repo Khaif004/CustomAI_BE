@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-from langchain.schema import Document
+from langchain_core.documents import Document
 from app.knowledge.vector_store import VectorStoreManager
 from app.knowledge.document_store import DocumentStore
 from app.config import get_settings
