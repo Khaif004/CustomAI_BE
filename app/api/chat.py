@@ -163,6 +163,26 @@ async def chat_with_file(
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@router.post("/generate-title")
+async def generate_title(request: ChatRequest, current_user=Depends(get_current_user)):
+    """Generate a short conversation title from the first message using AI"""
+    if chat_agent is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Chat service not available")
+
+    prompt = f"Generate a short, concise title (max 6 words) for a conversation that starts with this message. Return ONLY the title, no quotes, no extra text.\n\nMessage: {request.message}"
+
+    try:
+        result = await chat_agent.get_response(message=prompt, history=None)
+        title = result.get("response", "").strip().strip('"').strip("'")
+        if not title or len(title) > 60:
+            title = request.message[:40].rsplit(" ", 1)[0] + "..."
+        return {"title": title}
+    except Exception as e:
+        logger.error(f"Title generation error: {e}")
+        title = request.message[:40].rsplit(" ", 1)[0] + "..."
+        return {"title": title}
+
+
 @router.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
     is_healthy = chat_agent is not None
