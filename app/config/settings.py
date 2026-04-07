@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     token_refresh_days: int = 7
 
+    xsuaa_public_key: Optional[str] = None
+    xsuaa_issuer: Optional[str] = None
+
+    @property
+    def xsuaa_public_key_formatted(self) -> Optional[str]:
+        """Convert escaped newlines in public key to actual newlines"""
+        if not self.xsuaa_public_key:
+            return None
+        return self.xsuaa_public_key.replace('\\n', '\n')
+
     allowed_origins: str = "http://localhost:3000,http://localhost:5173"
 
     @property
