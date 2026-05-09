@@ -1,0 +1,14 @@
+# Exclude local virtual environment - CF python buildpack installs from requirements.txt
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Exclude local data/vector store - not needed for CF deployment
+data/
+
+# Exclude dev/test files
+.env
+*.log
+.pytest_cache/
