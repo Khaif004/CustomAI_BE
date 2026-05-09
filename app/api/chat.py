@@ -99,7 +99,16 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
             logger.error(f"Streaming error: {e}", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/upload")

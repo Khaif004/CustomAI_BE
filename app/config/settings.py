@@ -1,6 +1,34 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import List, Optional
+import json
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _read_xsuaa_from_vcap() -> dict:
+    """Read XSUAA credentials from CF VCAP_SERVICES environment variable."""
+    vcap_str = os.environ.get("VCAP_SERVICES")
+    if not vcap_str:
+        return {}
+    try:
+        vcap = json.loads(vcap_str)
+        xsuaa_list = vcap.get("xsuaa", [])
+        if not xsuaa_list:
+            return {}
+        creds = xsuaa_list[0].get("credentials", {})
+        result = {}
+        if creds.get("verificationkey"):
+            result["xsuaa_public_key"] = creds["verificationkey"]
+        if creds.get("url"):
+            result["xsuaa_issuer"] = creds["url"]
+        logger.info(f"Loaded XSUAA config from VCAP_SERVICES (issuer: {result.get('xsuaa_issuer')})")
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to parse VCAP_SERVICES: {e}")
+        return {}
 
 
 class Settings(BaseSettings):
@@ -95,4 +123,5 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
-    return Settings()
+    vcap_overrides = _read_xsuaa_from_vcap()
+    return Settings(**vcap_overrides)
