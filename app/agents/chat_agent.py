@@ -18,13 +18,16 @@ class ChatAgent:
 
     def __init__(self):
         model_name = getattr(settings, 'openai_model', 'gpt-3.5-turbo')
+
         self.llm = ChatOpenAI(
             model=model_name,
             temperature=0.7,
             api_key=settings.openai_api_key,
             max_tokens=1000,
-            request_timeout=30
+            request_timeout=30,
+            streaming=True
         )
+
         logger.info(f"LLM initialized: {model_name}")
 
         self.prompt = ChatPromptTemplate.from_messages([
@@ -37,7 +40,27 @@ class ChatAgent:
 
         self.total_requests = 0
         self.last_request_time = None
+
         logger.info("ChatAgent initialized")
+
+    def _format_history(self, history):
+        formatted_history = []
+
+        if history:
+            for msg in history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+
+                if role == "user":
+                    formatted_history.append(HumanMessage(content=content))
+
+                elif role == "assistant":
+                    formatted_history.append(AIMessage(content=content))
+
+                elif role == "system":
+                    formatted_history.append(SystemMessage(content=content))
+
+        return formatted_history
 
     def _get_system_prompt(self) -> str:
         return """You are an intelligent AI assistant specialized in SAP Business Technology Platform (BTP).
@@ -65,31 +88,35 @@ When helping with code:
 - Suggest improvements when relevant
 - Consider SAP-specific patterns and conventions"""
 
-    async def get_response(self, message: str, history: List[Dict[str, str]] = None) -> Dict[str, Any]:
+    async def get_response(
+        self,
+        message: str,
+        history: List[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+
         start_time = time.time()
+
         self.total_requests += 1
         self.last_request_time = start_time
 
         try:
-            logger.info(f"Processing request #{self.total_requests}: {message[:50]}...")
+            logger.info(
+                f"Processing request #{self.total_requests}: "
+                f"{message[:50]}..."
+            )
 
-            # Format conversation history
-            formatted_history = []
-            if history:
-                for msg in history:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        formatted_history.append(HumanMessage(content=content))
-                    elif role == "assistant":
-                        formatted_history.append(AIMessage(content=content))
-                    elif role == "system":
-                        formatted_history.append(SystemMessage(content=content))
+            formatted_history = self._format_history(history)
 
-            response = await self.chain.ainvoke({"input": message, "history": formatted_history})
+            response = await self.chain.ainvoke({
+                "input": message,
+                "history": formatted_history
+            })
+
             response_time = time.time() - start_time
 
-            logger.info(f"Response generated in {response_time:.2f}s")
+            logger.info(
+                f"Response generated in {response_time:.2f}s"
+            )
 
             return {
                 "response": response,
@@ -99,25 +126,43 @@ When helping with code:
             }
 
         except Exception as e:
-            logger.error(f"Error in ChatAgent.get_response: {e}", exc_info=True)
+            logger.error(
+                f"Error in ChatAgent.get_response: {e}",
+                exc_info=True
+            )
             raise
 
-    async def stream_response(self, message: str, history: List[Dict[str, str]] = None):
+    async def stream_response(
+        self,
+        message: str,
+        history: List[Dict[str, str]] = None
+    ):
         self.total_requests += 1
-        formatted_history = []
-        if history:
-            for msg in history:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role == "user":
-                    formatted_history.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    formatted_history.append(AIMessage(content=content))
-                elif role == "system":
-                    formatted_history.append(SystemMessage(content=content))
+        self.last_request_time = time.time()
 
-        async for chunk in self.chain.astream({"input": message, "history": formatted_history}):
-            yield chunk
+        try:
+            formatted_history = self._format_history(history)
+
+            async for chunk in self.chain.astream({
+                "input": message,
+                "history": formatted_history
+            }):
+                if isinstance(chunk, str):
+                    text = chunk
+                elif hasattr(chunk, "content"):
+                    text = chunk.content or ""
+                else:
+                    text = str(chunk)
+
+                if text:
+                    yield text
+
+        except Exception as e:
+            logger.error(
+                f"Error in stream_response: {e}",
+                exc_info=True
+            )
+            raise
 
     def get_status(self) -> Dict[str, Any]:
         return {

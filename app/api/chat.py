@@ -107,6 +107,7 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
             "X-Accel-Buffering": "no",
             "X-Content-Type-Options": "nosniff",
             "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
         },
     )
 
