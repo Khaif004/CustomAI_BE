@@ -46,11 +46,21 @@ class VectorStoreManager:
         ids = self.vector_store.add_documents(documents)
         return ids or [f"doc_{i}" for i in range(len(documents))]
 
-    def search(self, query: str, k: int = 5, score_threshold: float = 0.0) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 5, score_threshold: float = 0.0,
+               metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if settings.vector_store_type == "faiss" and self.vector_store is None:
             return []
 
-        results = self.vector_store.similarity_search_with_score(query, k=k)
+        try:
+            if metadata_filter and settings.vector_store_type == "chroma":
+                results = self.vector_store.similarity_search_with_score(
+                    query, k=k, filter=metadata_filter
+                )
+            else:
+                results = self.vector_store.similarity_search_with_score(query, k=k)
+        except Exception as e:
+            logger.warning(f"Vector search failed (filter={metadata_filter}): {e}")
+            results = self.vector_store.similarity_search_with_score(query, k=k)
 
         return [
             {"content": doc.page_content, "score": 1 / (1 + score) if score > 1 else score,

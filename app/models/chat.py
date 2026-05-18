@@ -33,6 +33,12 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     project_context: Optional[str] = None
     stream: bool = False
+    app_id: Optional[str] = Field(
+        None,
+        description="ID of the host application. When provided, relevant context is retrieved "
+                    "from that app's registered knowledge and injected into the LLM prompt.",
+        pattern=r"^[a-zA-Z0-9_-]*$",
+    )
 
 
 class ChatResponse(BaseModel):

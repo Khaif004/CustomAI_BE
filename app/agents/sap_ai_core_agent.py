@@ -67,9 +67,43 @@ class SAPAICoreAgent:
 
         logger.info(f"SAP AI Core Agent configured - model: {model_id}, deployment: {deployment_id}")
 
-    async def get_response(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    async def _fetch_rag_context(self, message: str, app_id: Optional[str]) -> Optional[str]:
+        """Retrieve relevant chunks from the vector store for the given query + app_id."""
+        if not app_id:
+            return None
+        try:
+            from app.knowledge.knowledge_base import get_knowledge_base
+            kb = get_knowledge_base()
+            ctx = kb.search_with_app_context(query=message, app_id=app_id)
+            return ctx if ctx else None
+        except Exception as e:
+            logger.warning(f"RAG context fetch failed for app '{app_id}': {e}")
+            return None
+
+    def _build_system_message(self, rag_context: Optional[str] = None, app_id: Optional[str] = None) -> str:
+        base = (
+            "You are a helpful AI assistant for enterprise software and cloud services. "
+            "When including links, always use markdown format with a descriptive human-readable title "
+            "as the link text — never use the raw URL as the label. "
+            "Example: [SAP BTP Documentation](https://help.sap.com/docs/btp) "
+            "not [https://help.sap.com/docs/btp](https://help.sap.com/docs/btp)."
+        )
+        if rag_context:
+            base += (
+                f"\n\nYou are currently assisting a user inside the '{app_id}' application. "
+                "Use the following retrieved context from that application to answer accurately. "
+                "If the question is general, answer normally. If it's about this application's data "
+                "or entities, prioritise the context below.\n\n"
+                + rag_context
+            )
+        return base
+
+    async def get_response(self, message: str, history: Optional[List[Dict[str, str]]] = None, app_id: Optional[str] = None) -> Dict[str, Any]:
         self.request_count += 1
         start_time = datetime.utcnow()
+
+        rag_context = await self._fetch_rag_context(message, app_id)
+        system_message = self._build_system_message(rag_context, app_id)
 
         token = await self.auth_client.get_token()
 
@@ -81,7 +115,7 @@ class SAPAICoreAgent:
 
         # Build orchestration template messages
         template_messages = [
-            {"role": "system", "content": "You are a helpful AI assistant for enterprise software and cloud services. When including links, always use markdown format with a descriptive human-readable title as the link text — never use the raw URL as the label. Example: [SAP BTP Documentation](https://help.sap.com/docs/btp) not [https://help.sap.com/docs/btp](https://help.sap.com/docs/btp)."},
+            {"role": "system", "content": system_message},
         ]
         if history:
             for msg in history[-10:]:
@@ -93,7 +127,7 @@ class SAPAICoreAgent:
                 "module_configurations": {
                     "llm_module_config": {
                         "model_name": self.model_id,
-                        "model_params": {"max_tokens": 1024, "temperature": 0.7, "top_p": 0.9}
+                        "model_params": {"max_tokens": 4096, "temperature": 0.7, "top_p": 0.9}
                     },
                     "templating_module_config": {"template": template_messages}
                 }
@@ -111,23 +145,61 @@ class SAPAICoreAgent:
                 if response.status != 200:
                     raise Exception(f"API error {response.status}: {response_text}")
 
-                result = await response.json()
+                import json as _json
+                try:
+                    result = _json.loads(response_text)
+                except Exception:
+                    raise Exception(f"Failed to parse API response: {response_text[:500]}")
 
-                # Parse orchestration response format
+                # Parse orchestration response — log structure to diagnose extraction path
+                logger.info(f"API response keys: {list(result.keys())}")
+
                 content = ""
+                # Path 1: module_results.llm.choices (orchestration v1)
                 module_results = result.get("module_results", {})
                 llm_result = module_results.get("llm", {})
                 if "choices" in llm_result and len(llm_result["choices"]) > 0:
                     content = llm_result["choices"][0].get("message", {}).get("content", "")
+                    logger.info(f"Extracted via module_results.llm.choices ({len(content)} chars)")
+                # Path 2: orchestration_result.choices (orchestration v2)
+                elif "orchestration_result" in result:
+                    orch = result["orchestration_result"]
+                    choices = orch.get("choices", [])
+                    if choices:
+                        content = choices[0].get("message", {}).get("content", "")
+                        logger.info(f"Extracted via orchestration_result.choices ({len(content)} chars)")
+                # Path 3: top-level choices
                 elif "choices" in result and len(result["choices"]) > 0:
                     content = result["choices"][0].get("message", {}).get("content", "")
+                    logger.info(f"Extracted via top-level choices ({len(content)} chars)")
+                # Path 4: fallback scalar fields
                 else:
-                    content = result.get("completion") or result.get("text") or result.get("output") or str(result)
+                    content = result.get("completion") or result.get("text") or result.get("output") or ""
+                    logger.warning(f"Fell back to scalar extraction, result keys: {list(result.keys())}")
+                    if not content:
+                        # Last resort: dump so we can see the structure
+                        logger.error(f"Could not extract content. Full response: {response_text[:1000]}")
 
                 response_time = (datetime.utcnow() - start_time).total_seconds()
                 logger.info(f"Response received ({response_time:.2f}s)")
 
                 return {"response": content, "model": self.model_id, "response_time": response_time}
+
+    async def stream_response(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        app_id: Optional[str] = None,
+    ):
+        """Stream response token-by-token using word-level chunking."""
+        result = await self.get_response(message=message, history=history, app_id=app_id)
+        text = result.get("response", "")
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            chunk = word if i == 0 else " " + word
+            if chunk:
+                yield chunk
+            await asyncio.sleep(0)
 
     def get_status(self) -> Dict[str, Any]:
         return {

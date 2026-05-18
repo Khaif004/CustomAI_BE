@@ -57,6 +57,13 @@ try:
 except Exception as e:
     logger.error(f"Failed to register auth routes: {e}")
 
+try:
+    from app.api import apps as apps_api
+    app.include_router(apps_api.router)
+    logger.info("Apps context API routes registered")
+except Exception as e:
+    logger.warning(f"Apps context routes not available: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn

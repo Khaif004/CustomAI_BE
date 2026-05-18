@@ -53,7 +53,7 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
         if request.conversation_history:
             history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
 
-        result = await chat_agent.get_response(message=request.message, history=history)
+        result = await chat_agent.get_response(message=request.message, history=history, app_id=request.app_id)
 
         return ChatResponse(
             response=result["response"],
@@ -82,10 +82,10 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
             start_time = time.time()
 
             if hasattr(chat_agent, 'stream_response'):
-                async for chunk in chat_agent.stream_response(message=request.message, history=history):
+                async for chunk in chat_agent.stream_response(message=request.message, history=history, app_id=request.app_id):
                     yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
             else:
-                result = await chat_agent.get_response(message=request.message, history=history)
+                result = await chat_agent.get_response(message=request.message, history=history, app_id=request.app_id)
                 words = result["response"].split(" ")
                 for i, word in enumerate(words):
                     yield f"data: {json.dumps({'type': 'chunk', 'content': word if i == 0 else ' ' + word})}\n\n"
@@ -154,7 +154,7 @@ async def chat_with_file(
             parsed_history = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in history] if history else None
 
             if hasattr(chat_agent, 'stream_response'):
-                async for chunk in chat_agent.stream_response(message=combined_message, history=parsed_history):
+                async for chunk in chat_agent.stream_response(message=combined_message, history=parsed_history, app_id=None):
                     yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
             else:
                 result = await chat_agent.get_response(message=combined_message, history=parsed_history)
