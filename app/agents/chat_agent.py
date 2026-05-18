@@ -86,7 +86,13 @@ When helping with code:
 - Explain what the code does
 - Highlight best practices
 - Suggest improvements when relevant
-- Consider SAP-specific patterns and conventions"""
+- Consider SAP-specific patterns and conventions
+
+When including links:
+- Always use markdown link format: [Descriptive Title](url)
+- The link text must be a short, meaningful human-readable title — never paste the raw URL as the label
+- Good examples: [Virat Kohli – Wikipedia](https://en.wikipedia.org/wiki/Virat_Kohli), [SAP BTP Documentation](https://help.sap.com/docs/btp)
+- Bad examples: [https://en.wikipedia.org/wiki/Virat_Kohli](https://en.wikipedia.org/wiki/Virat_Kohli)"""
 
     async def get_response(
         self,

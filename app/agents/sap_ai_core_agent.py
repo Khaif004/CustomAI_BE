@@ -81,7 +81,7 @@ class SAPAICoreAgent:
 
         # Build orchestration template messages
         template_messages = [
-            {"role": "system", "content": "You are a helpful AI assistant for enterprise software and cloud services."},
+            {"role": "system", "content": "You are a helpful AI assistant for enterprise software and cloud services. When including links, always use markdown format with a descriptive human-readable title as the link text — never use the raw URL as the label. Example: [SAP BTP Documentation](https://help.sap.com/docs/btp) not [https://help.sap.com/docs/btp](https://help.sap.com/docs/btp)."},
         ]
         if history:
             for msg in history[-10:]:
