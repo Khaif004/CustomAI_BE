@@ -64,6 +64,13 @@ try:
 except Exception as e:
     logger.warning(f"Apps context routes not available: {e}")
 
+try:
+    from app.api import documents
+    app.include_router(documents.router)
+    logger.info("Documents API routes registered")
+except Exception as e:
+    logger.warning(f"Documents routes not available: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn
