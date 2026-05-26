@@ -50,42 +50,89 @@ def _detect_doc_intent_regex(message: str) -> str | None:
     return None
 
 
+def _looks_like_shared_document(message: str) -> bool:
+    """
+    Return True when the message is almost certainly content being SHARED by the
+    user (a spec, report, email, article, etc.) rather than a short command.
+
+    Heuristics:
+    - Very long messages (> 400 chars) that contain multiple newlines are almost
+      always pasted documents, not generation commands.
+    - Structural markers such as headings, numbered sections, or table-like lines
+      reinforce this further.
+    """
+    if len(message) < 400:
+        return False
+
+    lines = [l for l in message.splitlines() if l.strip()]
+    if len(lines) < 5:
+        return False
+
+    heading_re = re.compile(r'^#{1,4}\s+\S|^\d+\.\s+[A-Z]|^[A-Z][A-Za-z ]{3,}:?\s*$')
+    structural_lines = sum(1 for l in lines if heading_re.match(l.strip()))
+    if structural_lines >= 2:
+        return True
+
+    if len(message) > 800 and len(lines) >= 8:
+        return True
+
+    return False
+
+
 async def _classify_doc_intent(message: str) -> str | None:
     """
     Detect if the user is requesting a new downloadable document.
 
-    Strategy (cheapest-first):
-    1. Keyword gate  – instant reject if no doc-related words
-    2. Regex         – instant accept for obvious explicit forms
-    3. LLM call      – single ~30-token call for ambiguous phrasings
-                       e.g. "can you give me a word document about X"
+    Strategy:
+    1. Keyword gate      – instant reject if no doc-related words at all
+    2. Shared-doc check  – if the message is clearly pasted/shared content,
+                           skip the regex and go straight to the LLM so the
+                           full context is considered (regex would false-positive
+                           on phrases like "Output Management determines the PDF")
+    3. Regex fast-path   – instant accept for short, explicit generation commands
+    4. LLM classifier    – holistic intent check for everything else
     """
-    # Step 1 – no document keywords at all → definitely not a doc request
     if not _DOC_KEYWORD_GATE.search(message):
         return None
 
-    # Step 2 – regex fast-path (no LLM cost)
-    regex_result = _detect_doc_intent_regex(message)
-    if regex_result:
-        return regex_result
+    shared = _looks_like_shared_document(message)
 
-    # Step 3 – LLM classifier for natural phrasings the regex can't catch
+    if not shared:
+        regex_result = _detect_doc_intent_regex(message)
+        if regex_result:
+            return regex_result
+
     if chat_agent is None:
         return None
 
     classify_prompt = (
-        "You are a single-purpose JSON classifier. "
-        "Does this user message ask you to generate/create/write/give/provide a new downloadable document file?\n\n"
-        f"Message: {json.dumps(message)}\n\n"
+        "You are a single-purpose JSON classifier that decides whether a user wants "
+        "you to generate a new downloadable document file.\n\n"
+        "CRITICAL DISTINCTION — read carefully:\n"
+        "  A) The user is SHARING content (a spec, report, email, article, requirements "
+        "document, etc.) and asking you to analyse, summarise, explain, or discuss it. "
+        "     → doc=false\n"
+        "  B) The user is ASKING you to CREATE a new file they can download. "
+        "     → doc=true\n\n"
+        "Key rules:\n"
+        "- If the message is long and structured (multiple paragraphs, headings, tables) "
+        "it is almost certainly case A — the user is sharing it, not requesting it.\n"
+        "- Words like 'pdf', 'document', 'generate', 'output' that appear INSIDE shared "
+        "content do NOT mean the user wants you to generate a document.\n"
+        "- doc=true only when the user's OWN words (not the content they pasted) "
+        "explicitly ask for a new file to download.\n"
+        "- If in doubt, return doc=false.\n\n"
+        f"Message: {json.dumps(message[:3000])}\n\n"
         "Reply with ONLY one JSON object, no other text:\n"
-        '{"doc":true,"type":"word"}   <- Word/.docx requested\n'
-        '{"doc":true,"type":"pdf"}    <- PDF requested\n'
-        '{"doc":true,"type":"excel"}  <- Excel/spreadsheet requested\n'
-        '{"doc":false}                <- no document requested\n\n'
-        "Rules: doc=true only when the user explicitly wants a NEW file to download. "
-        'Default type is "word" when format is not specified. '
-        '"give me a word document about X" -> {"doc":true,"type":"word"}. '
-        '"will generate the PDF" (internal process reference) -> {"doc":false}.'
+        '{"doc":true,"type":"word"}   <- user is asking for a Word/.docx file\n'
+        '{"doc":true,"type":"pdf"}    <- user is asking for a PDF file\n'
+        '{"doc":true,"type":"excel"}  <- user is asking for an Excel/spreadsheet\n'
+        '{"doc":false}                <- user is sharing content or asking a question\n\n'
+        "Examples:\n"
+        '"give me a word document about X" -> {"doc":true,"type":"word"}\n'
+        '"here is our spec, can you explain it?" -> {"doc":false}\n'
+        '"[long functional specification text]" -> {"doc":false}\n'
+        '"will generate the PDF" (internal process reference) -> {"doc":false}'
     )
 
     try:
@@ -106,8 +153,29 @@ async def _classify_doc_intent(message: str) -> str | None:
         logger.warning(f"LLM doc-intent classification failed: {ex}")
         return None
 
+def _enrich_message_with_fiori_context(message: str, fiori_context: dict | None) -> str:
+    """Prepend a structured context block to the user message when a Fiori app has sent entity data."""
+    if not fiori_context:
+        return message
+
+    lines = ["[Context from the Fiori application you are embedded in]"]
+    if fiori_context.get("appId"):
+        lines.append(f"App: {fiori_context['appId']}")
+    if fiori_context.get("serviceUrl"):
+        lines.append(f"OData service: {fiori_context['serviceUrl']}")
+    if fiori_context.get("urlHash"):
+        lines.append(f"Current view: {fiori_context['urlHash']}")
+    entity = fiori_context.get("entityData")
+    if entity and isinstance(entity, dict):
+        lines.append("Current record:")
+        for k, v in entity.items():
+            if v is not None:
+                lines.append(f"  {k}: {v}")
+    lines.append("[End of context]\n")
+    return "\n".join(lines) + message
+
+
 async def _generate_doc_event(message: str, doc_type: str, app_id: str | None) -> dict:
-    """Build and base64-encode the requested document via LLM (used for Excel). Returns a dict for the SSE event."""
     from app.api.documents import _get_document_content, BUILDERS, EXTENSIONS
     data = await _get_document_content(message, doc_type, None)
     file_bytes = BUILDERS[doc_type](data)
@@ -383,7 +451,8 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
                 history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
 
             start_time = time.time()
-            doc_type = await _classify_doc_intent(request.message)
+            enriched_message = _enrich_message_with_fiori_context(request.message, request.fiori_context)
+            doc_type = await _classify_doc_intent(enriched_message)
             model_name = (
                 getattr(getattr(chat_agent, 'llm', None), 'model_name', None)
                 or getattr(chat_agent, 'model_id', 'unknown')
@@ -396,8 +465,7 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
 
                 try:
                     from app.api.documents import _get_document_content, BUILDERS, EXTENSIONS
-                    # One LLM call for the full structured content
-                    data = await _get_document_content(request.message, doc_type, None)
+                    data = await _get_document_content(enriched_message, doc_type, None)
 
                     # 2. Stream a short overview (no extra LLM call)
                     overview = _short_overview_from_data(data, doc_type)
@@ -432,10 +500,10 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
             else:
                 # ── Normal chat path ──────────────────────────────────────────────
                 if hasattr(chat_agent, 'stream_response'):
-                    async for chunk in chat_agent.stream_response(message=request.message, history=history, app_id=request.app_id):
+                    async for chunk in chat_agent.stream_response(message=enriched_message, history=history, app_id=request.app_id):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
                 else:
-                    result = await chat_agent.get_response(message=request.message, history=history, app_id=request.app_id)
+                    result = await chat_agent.get_response(message=enriched_message, history=history, app_id=request.app_id)
                     words = result["response"].split(" ")
                     for i, word in enumerate(words):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': word if i == 0 else ' ' + word})}\n\n"

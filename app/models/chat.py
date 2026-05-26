@@ -28,7 +28,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=5000)
+    message: str = Field(..., min_length=1, max_length=500000)
     conversation_history: Optional[List[ChatMessage]] = None
     conversation_id: Optional[str] = None
     project_context: Optional[str] = None
@@ -38,6 +38,11 @@ class ChatRequest(BaseModel):
         description="ID of the host application. When provided, relevant context is retrieved "
                     "from that app's registered knowledge and injected into the LLM prompt.",
         pattern=r"^[a-zA-Z0-9_-]*$",
+    )
+    fiori_context: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Context payload sent from an embedded Fiori/UI5 application via postMessage. "
+                    "Contains the current entity data, URL hash, appId, and serviceUrl.",
     )
 
 
