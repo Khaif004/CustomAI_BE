@@ -44,6 +44,12 @@ class ChatRequest(BaseModel):
         description="Context payload sent from an embedded Fiori/UI5 application via postMessage. "
                     "Contains the current entity data, URL hash, appId, and serviceUrl.",
     )
+    odata_token: Optional[str] = Field(
+        None,
+        description="Bearer token forwarded from the host Fiori app (XSUAA or JWT). "
+                    "Used by the backend to proxy OData calls on behalf of the user so the "
+                    "chatbot can fetch real record counts and data.",
+    )
 
 
 class ChatResponse(BaseModel):

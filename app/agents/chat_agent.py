@@ -109,6 +109,8 @@ When including links:
         message: str,
         history: List[Dict[str, str]] = None,
         app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
+        odata_token: Optional[str] = None,
     ) -> Dict[str, Any]:
 
         start_time = time.time()
@@ -147,6 +149,7 @@ When including links:
         message: str,
         history: List[Dict[str, str]] = None,
         app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
     ):
         self.total_requests += 1
         self.last_request_time = time.time()
@@ -283,7 +286,10 @@ When including links:
     async def get_response(
         self,
         message: str,
-        history: List[Dict[str, str]] = None
+        history: List[Dict[str, str]] = None,
+        app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
+        odata_token: Optional[str] = None,
     ) -> Dict[str, Any]:
 
         start_time = time.time()
@@ -327,7 +333,10 @@ When including links:
     async def stream_response(
         self,
         message: str,
-        history: List[Dict[str, str]] = None
+        history: List[Dict[str, str]] = None,
+        app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
+        odata_token: Optional[str] = None,
     ):
         self.total_requests += 1
         self.last_request_time = time.time()

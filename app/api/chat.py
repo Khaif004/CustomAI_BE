@@ -154,23 +154,36 @@ async def _classify_doc_intent(message: str) -> str | None:
         return None
 
 def _enrich_message_with_fiori_context(message: str, fiori_context: dict | None) -> str:
-    """Prepend a structured context block to the user message when a Fiori app has sent entity data."""
+    """Prepend a structured context block to the user message when a Fiori app has sent entity data.
+
+    Handles both snake_case keys (from BTP Copilot SDK) and camelCase keys (legacy format).
+    """
     if not fiori_context:
         return message
 
+    # Support both snake_case (SDK widget) and camelCase (legacy) key formats
+    app_id      = fiori_context.get("app_id") or fiori_context.get("appId")
+    service_url = fiori_context.get("service_url") or fiori_context.get("serviceUrl")
+    view        = fiori_context.get("current_view") or fiori_context.get("urlHash")
+    entity      = fiori_context.get("entity_data") or fiori_context.get("entityData")
+    extra       = fiori_context.get("extra") or {}
+    schema_hint = extra.get("schema_hint") if isinstance(extra, dict) else None
+
     lines = ["[Context from the Fiori application you are embedded in]"]
-    if fiori_context.get("appId"):
-        lines.append(f"App: {fiori_context['appId']}")
-    if fiori_context.get("serviceUrl"):
-        lines.append(f"OData service: {fiori_context['serviceUrl']}")
-    if fiori_context.get("urlHash"):
-        lines.append(f"Current view: {fiori_context['urlHash']}")
-    entity = fiori_context.get("entityData")
+    if app_id:
+        lines.append(f"App: {app_id}")
+    if service_url:
+        lines.append(f"OData service: {service_url}")
+    if view:
+        lines.append(f"Current view: {view}")
     if entity and isinstance(entity, dict):
         lines.append("Current record:")
         for k, v in entity.items():
             if v is not None:
                 lines.append(f"  {k}: {v}")
+    if schema_hint:
+        # Schema auto-fetched from $metadata by the widget — gives AI entity field knowledge
+        lines.append(f"OData entity schema (from $metadata):\n{schema_hint[:3000]}")
     lines.append("[End of context]\n")
     return "\n".join(lines) + message
 
@@ -424,7 +437,13 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
         if request.conversation_history:
             history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
 
-        result = await chat_agent.get_response(message=request.message, history=history, app_id=request.app_id)
+        result = await chat_agent.get_response(
+            message=request.message,
+            history=history,
+            app_id=request.app_id,
+            fiori_context=request.fiori_context,
+            odata_token=getattr(request, 'odata_token', None),
+        )
 
         return ChatResponse(
             response=result["response"],
@@ -500,10 +519,22 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
             else:
                 # ── Normal chat path ──────────────────────────────────────────────
                 if hasattr(chat_agent, 'stream_response'):
-                    async for chunk in chat_agent.stream_response(message=enriched_message, history=history, app_id=request.app_id):
+                    async for chunk in chat_agent.stream_response(
+                        message=enriched_message,
+                        history=history,
+                        app_id=request.app_id,
+                        fiori_context=request.fiori_context,
+                        odata_token=getattr(request, 'odata_token', None),
+                    ):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
                 else:
-                    result = await chat_agent.get_response(message=enriched_message, history=history, app_id=request.app_id)
+                    result = await chat_agent.get_response(
+                        message=enriched_message,
+                        history=history,
+                        app_id=request.app_id,
+                        fiori_context=request.fiori_context,
+                        odata_token=getattr(request, 'odata_token', None),
+                    )
                     words = result["response"].split(" ")
                     for i, word in enumerate(words):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': word if i == 0 else ' ' + word})}\n\n"

@@ -67,6 +67,364 @@ class SAPAICoreAgent:
 
         logger.info(f"SAP AI Core Agent configured - model: {model_id}, deployment: {deployment_id}")
 
+    # ── Schema-hint helpers (used by _fetch_real_data) ───────────────────────
+
+    def _parse_entity_section(self, entity: str, schema_hint: str) -> str:
+        """Return the raw text block for 'entity' from schema_hint.
+        Supports ODataProbe format ('## EntityName entity schema'),
+        SchemaExtractor format ('## Entity: EntityName'), and plain ('## EntityName')."""
+        import re as _re
+        for pat in [
+            rf'^##\s+{_re.escape(entity)}\s+entity\s+schema\s*$',
+            rf'^##\s+Entity:\s+{_re.escape(entity)}\s*$',
+            rf'^##\s+{_re.escape(entity)}\s*$',
+        ]:
+            m = _re.search(pat + r'(.*?)(?=^##\s|\Z)',
+                           schema_hint, _re.MULTILINE | _re.DOTALL)
+            if m:
+                return m.group(1)
+        return ""
+
+    def _parse_entity_fields(self, entity: str, schema_hint: str) -> list:
+        """Extract scalar field names for 'entity' from schema_hint.
+        Handles ODataProbe inline format ('Fields: f1 (Type), f2 (Type)')
+        and SchemaExtractor bullet format ('- fieldName (Type...)')."""
+        import re as _re
+        section = self._parse_entity_section(entity, schema_hint)
+        if not section:
+            return []
+        fields: list = []
+        for line in section.splitlines():
+            m = _re.match(r'^(?:Fields|Key\s+fields|Key fields):\s+(.+)$', line.strip())
+            if m:
+                for item in m.group(1).split(','):
+                    fn = _re.match(r'^\s*(\w+)\s*\(', item)
+                    if fn and fn.group(1) not in fields:
+                        fields.append(fn.group(1))
+        for match in _re.finditer(r'^-\s+(\w+)\s*\(', section, _re.MULTILINE):
+            name = match.group(1)
+            if name not in fields:
+                fields.append(name)
+        return fields
+
+    def _parse_associations(self, entity: str, schema_hint: str) -> list:
+        """Return list of (navPropName, targetEntityName) for 'entity'.
+        Handles ODataProbe ('Navigation: nav → Target[]') and
+        SchemaExtractor ('- navProp → Target (association...)') formats."""
+        import re as _re
+        section = self._parse_entity_section(entity, schema_hint)
+        if not section:
+            return []
+        assocs: list = []
+        for line in section.splitlines():
+            m = _re.match(r'^Navigation:\s+(.+)$', line.strip())
+            if m:
+                for item in m.group(1).split(','):
+                    pair = _re.match(r'^\s*(\w+)\s*(?:→|->|>)\s*(\w+)', item.strip())
+                    if pair:
+                        nav, tgt = pair.group(1), pair.group(2).rstrip('[]')
+                        if (nav, tgt) not in assocs:
+                            assocs.append((nav, tgt))
+        for match in _re.finditer(r'^-\s+(\w+)\s+(?:→|->|>)\s+(\w+)\s*\(', section, _re.MULTILINE):
+            nav, tgt = match.group(1), match.group(2)
+            if (nav, tgt) not in assocs:
+                assocs.append((nav, tgt))
+        return assocs
+
+    def _build_filter(self, message: str, fields: list) -> Optional[str]:
+        """Build an OData $filter clause from natural language using known field names.
+
+        Patterns detected:
+          - '{field} is/= {value}' or 'with {field} {value}'  → field eq 'value'
+          - '{field} greater/less than {n}'                    → field gt/lt n
+          - Bare ALL_CAPS word (e.g. PENDING) near a status field → status eq 'PENDING'
+        """
+        import re as _re
+        COMPARISON_WORDS = {'greater', 'less', 'more', 'above', 'below', 'than',
+                            'at', 'most', 'least', 'equal', 'between'}
+        filters: list = []
+        for field in fields:
+            fl = _re.escape(field.lower())
+            matched = False
+            # 1. Numeric comparisons FIRST — prevents 'greater' being captured as a value
+            for op_re, odata_op in [
+                (r'(?:greater\s+than|more\s+than|above|>)\s+', 'gt'),
+                (r'(?:less\s+than|below|<)\s+',               'lt'),
+                (r'(?:at\s+least|>=)\s+',                     'ge'),
+                (r'(?:at\s+most|<=)\s+',                      'le'),
+            ]:
+                hit = _re.search(rf'\b{fl}\s+(?:is\s+|are\s+)?{op_re}(\d+(?:\.\d+)?)', message, _re.IGNORECASE)
+                if hit:
+                    filters.append(f"{field} {odata_op} {hit.group(1)}")
+                    matched = True
+                    break
+            if matched:
+                continue
+            # 2. Explicit eq patterns — search original message to preserve value case
+            for pat in [
+                rf'\b{fl}\s+(?:is|eq|=|:)\s+["\']?([A-Za-z0-9_\-]+)["\']?',
+                rf'\bwith\s+{fl}\s+(?:of\s+)?["\']?([A-Za-z0-9_\-]+)["\']?',
+                rf'\b{fl}\s+["\']([^"\']+)["\']',
+            ]:
+                hit = _re.search(pat, message, _re.IGNORECASE)
+                if hit:
+                    val = hit.group(1)
+                    # Ignore if the captured token is itself a comparison keyword
+                    if val.lower() in COMPARISON_WORDS:
+                        continue
+                    filters.append(
+                        f"{field} eq {val}"
+                        if _re.match(r'^\d+(\.\d+)?$', val)
+                        else f"{field} eq '{val}'"
+                    )
+                    matched = True
+                    break
+        # Fallback: bare ALL_CAPS token (e.g. PENDING, APPROVED, DRAFT)
+        # → apply to first status-like field when nothing else matched
+        if not filters:
+            enum_hit = _re.search(r'\b([A-Z_]{3,})\b', message)
+            if enum_hit:
+                status_fields = [
+                    f for f in fields
+                    if f.lower() in ('status', 'state', 'type', 'category',
+                                     'priority', 'phase', 'stage')
+                ]
+                if status_fields:
+                    filters.append(f"{status_fields[0]} eq '{enum_hit.group(1)}'")
+        return " and ".join(filters) if filters else None
+
+    def _build_expand(self, message: str, assocs: list) -> Optional[str]:
+        """Build OData $expand when the message mentions terms matching
+        a navigation property name or its target entity (camelCase-aware)."""
+        import re as _re
+        msg_lower = message.lower()
+        expand: list = []
+        for nav_prop, target in assocs:
+            tokens: set = {nav_prop.lower(), target.lower()}
+            tokens |= {w.lower() for w in _re.split(r'(?<=[a-z])(?=[A-Z])|_', nav_prop) if len(w) > 2}
+            tokens |= {w.lower() for w in _re.split(r'(?<=[a-z])(?=[A-Z])|_', target)   if len(w) > 2}
+            if any(_re.search(r'\b' + _re.escape(t) + r'\b', msg_lower) for t in tokens):
+                expand.append(nav_prop)
+        return ",".join(expand) if expand else None
+
+    def _aggregate_python(self, rows: list, group_field: str) -> str:
+        """Group rows by a field in Python and return a breakdown string.
+        Field matching is case-insensitive so 'status' matches 'Status'."""
+        counts: dict = {}
+        resolved: Optional[str] = None
+        for row in rows:
+            if resolved is None:
+                for k in row.keys():
+                    if k.lower() == group_field.lower():
+                        resolved = k
+                        break
+            key = str(row.get(resolved, "unknown")) if resolved else "unknown"
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return f"  No rows returned for grouping by '{group_field}'."
+        label = resolved or group_field
+        lines = [f"  Count by {label}:"]
+        for k, v in sorted(counts.items(), key=lambda x: -x[1]):
+            lines.append(f"    {k}: {v}")
+        return "\n".join(lines)
+
+    # ── Main data fetcher ─────────────────────────────────────────────────────
+
+    async def _fetch_real_data(
+        self,
+        fiori_context: Optional[Dict[str, Any]],
+        odata_token: Optional[str],
+        message: str,
+    ) -> Optional[str]:
+        """
+        Detect data-retrieval questions and fetch live data from the app's OData service.
+        Returns a formatted block prepended to the user message so the LLM answers
+        with real data instead of generic guidance.
+
+        Three enhancements — all automatic, no app-side config required:
+          1. NL → $filter   "show PENDING blends"   → $filter=status eq 'PENDING'
+          2. Auto $expand   "blends with materials"  → $expand=materials
+          3. Python groupby "blends by status"       → group fetched rows in Python
+        """
+        if not fiori_context:
+            return None
+
+        service_url = (
+            fiori_context.get("service_url") or fiori_context.get("serviceUrl")
+        )
+        if not service_url:
+            return None
+
+        import re as _re
+        DATA_QUESTION = _re.compile(
+            r"\b(how many|count|total|list|show|get|fetch|all|any|exist|records?|entries|data)"
+            r".*\b",
+            _re.IGNORECASE,
+        )
+        if not DATA_QUESTION.search(message):
+            return None
+
+        schema_hint = (
+            (fiori_context.get("extra") or {}).get("schema_hint") or ""
+        )
+        raw_entities: list = _re.findall(
+            r"^###?\s+([A-Za-z][A-Za-z0-9_]+)\s*$", schema_hint, _re.MULTILINE
+        )
+        entity_names = [
+            e for e in raw_entities
+            if not e.lower().startswith("service")
+        ]
+        if not entity_names:
+            return None
+
+        # ── Entity matching (unchanged) ───────────────────────────────────────
+        msg_lower = message.lower()
+        best_entity: Optional[str] = None
+        for ent in entity_names:
+            if ent.lower() in msg_lower or msg_lower in ent.lower():
+                best_entity = ent
+                break
+        if not best_entity:
+            msg_words = set(_re.split(r'\W+', msg_lower))
+            scored = []
+            for ent in entity_names:
+                ent_words = set(
+                    w.lower()
+                    for w in _re.split(r'(?<=[a-z])(?=[A-Z])|_', ent)
+                    if len(w) > 2
+                )
+                stems = set()
+                for w in ent_words:
+                    stems.add(w)
+                    if w.endswith("tions"): stems.add(w[:-5])
+                    if w.endswith("tion"):  stems.add(w[:-4])
+                    if w.endswith("es"):    stems.add(w[:-2])
+                    if w.endswith("s"):     stems.add(w[:-1])
+                overlap = sum(
+                    1 for mw in msg_words
+                    if any(mw.startswith(stem[:4]) or stem.startswith(mw[:4])
+                           for stem in stems if len(stem) >= 4)
+                )
+                scored.append((overlap, ent))
+            scored.sort(reverse=True)
+            if scored and scored[0][0] > 0:
+                best_entity = scored[0][1]
+        if not best_entity and entity_names:
+            best_entity = entity_names[0]
+        if not best_entity:
+            return None
+
+        # ── Build OData query options from NL ─────────────────────────────────
+        fields = self._parse_entity_fields(best_entity, schema_hint)
+        assocs = self._parse_associations(best_entity, schema_hint)
+        odata_filter = self._build_filter(message, fields) if fields else None
+        odata_expand = self._build_expand(message, assocs)  if assocs else None
+
+        # Aggregation intent: "by status", "per category", "grouped by type"
+        AGG_PAT = _re.compile(
+            r'\b(?:by|per|group(?:ed)?\s+by|breakdown\s+by)\s+(\w+)',
+            _re.IGNORECASE
+        )
+        agg_match = AGG_PAT.search(message)
+        group_field: Optional[str] = agg_match.group(1) if agg_match else None
+
+        # ── Resolve relative URL ──────────────────────────────────────────────
+        if service_url.startswith("/"):
+            service_url = f"http://localhost:4004{service_url}"
+
+        try:
+            import aiohttp as _aio
+            import json as _json
+
+            headers: dict = {"Accept": "application/json"}
+            if odata_token:
+                headers["Authorization"] = (
+                    f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
+                )
+
+            base_url = f"{service_url.rstrip('/')}/{best_entity}"
+            count_val: Optional[int] = None
+            rows_data = None
+
+            async with _aio.ClientSession() as session:
+                # Aggregation needs a larger sample; otherwise 5 rows is enough
+                top = 200 if group_field else 5
+                list_params: dict = {"$top": top}
+                if odata_filter:
+                    list_params["$filter"] = odata_filter
+                if odata_expand:
+                    list_params["$expand"] = odata_expand
+                if not group_field:
+                    list_params["$count"] = "true"
+
+                # Fetch exact count (skip for aggregation — the grouping is the count)
+                if not group_field:
+                    count_params: dict = {}
+                    if odata_filter:
+                        count_params["$filter"] = odata_filter
+                    async with session.get(
+                        base_url + "/$count", params=count_params,
+                        headers=headers, timeout=_aio.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 200:
+                            try:
+                                count_val = int((await resp.text()).strip())
+                            except ValueError:
+                                pass
+
+                # Fetch rows (with optional filter + expand)
+                async with session.get(
+                    base_url, params=list_params,
+                    headers=headers, timeout=_aio.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows_data = data.get("value", [])
+                        if count_val is None and not group_field:
+                            total = data.get("@odata.count")
+                            if total is not None:
+                                count_val = int(total)
+
+            if count_val is None and rows_data is None:
+                return None
+
+            # ── Format output for the LLM ─────────────────────────────────────
+            lines = [f"[Real data from OData — {best_entity}]"]
+            applied = []
+            if odata_filter:
+                applied.append(f"$filter={odata_filter}")
+            if odata_expand:
+                applied.append(f"$expand={odata_expand}")
+            if group_field:
+                applied.append(f"grouped by '{group_field}'")
+            if applied:
+                lines.append(f"Applied: {', '.join(applied)}")
+
+            if group_field and rows_data is not None:
+                lines.append(f"Fetched {len(rows_data)} record(s) for grouping.")
+                lines.append(self._aggregate_python(rows_data, group_field))
+            else:
+                if count_val is not None:
+                    lines.append(f"Total record count: {count_val}")
+                if rows_data:
+                    lines.append(f"First {len(rows_data)} record(s):")
+                    for i, row in enumerate(rows_data[:5], 1):
+                        preview = {
+                            k: v for k, v in row.items()
+                            if not isinstance(v, (dict, list)) and v is not None
+                        }
+                        # Show expanded nav properties as "(N item(s))"
+                        for k, v in row.items():
+                            if isinstance(v, list) and v is not None:
+                                preview[k] = f"({len(v)} item(s))"
+                        lines.append(f"  {i}. {_json.dumps(preview, default=str)}")
+            lines.append("[End of live data]\n")
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.debug(f"OData fetch skipped ({best_entity}): {e}")
+            return None
+
     async def _fetch_rag_context(self, message: str, app_id: Optional[str]) -> Optional[str]:
         """Retrieve relevant chunks from the vector store for the given query + app_id."""
         if not app_id:
@@ -80,30 +438,124 @@ class SAPAICoreAgent:
             logger.warning(f"RAG context fetch failed for app '{app_id}': {e}")
             return None
 
-    def _build_system_message(self, rag_context: Optional[str] = None, app_id: Optional[str] = None) -> str:
+    def _build_system_message(
+        self,
+        rag_context: Optional[str] = None,
+        app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        import re as _re
+
+        # ── Extract dynamic app metadata from fiori_context ──────────────────
+        app_name = app_id
+        schema_hint = None
+        service_url = None
+
+        if fiori_context and isinstance(fiori_context, dict):
+            app_name = (
+                fiori_context.get("app_name")
+                or fiori_context.get("appName")
+                or fiori_context.get("app_id")
+                or fiori_context.get("appId")
+                or app_id
+            )
+            service_url = fiori_context.get("service_url") or fiori_context.get("serviceUrl")
+            extra = fiori_context.get("extra") or {}
+            if isinstance(extra, dict):
+                schema_hint = extra.get("schema_hint")
+
+        # ── Parse entity names from schema_hint (lines starting with ##) ─────
+        entity_names: list[str] = []
+        if schema_hint:
+            entity_names = [
+                m.strip()
+                for m in _re.findall(r'^##\s+(.+?)\s*$', schema_hint, _re.MULTILINE)
+                if m.strip()
+            ]
+
+        app_label = f'"{app_name}"' if app_name else "this SAP application"
+
+        # ── Dynamic entity section injected into system prompt ────────────────
+        entity_section = ""
+        if entity_names:
+            entity_list = ", ".join(f"`{e}`" for e in entity_names[:25])
+            entity_section = (
+                f"\n\nCURRENT APP ENTITIES — {app_label} exposes these OData entities: "
+                f"{entity_list}.\n"
+                "When the user mentions ANY business term (records, items, entries, incidents, "
+                "orders, jobs, tasks, blends, formulas, materials, components, documents, or any "
+                "domain-specific word), identify which of the entities above is the closest "
+                "semantic match and answer in terms of that entity. "
+                "Do NOT require the user to use the exact technical entity name."
+            )
+
         base = (
-            "You are a helpful AI assistant for enterprise software and cloud services. "
-            "When including links, always use markdown format with a descriptive human-readable title "
-            "as the link text — never use the raw URL as the label. "
-            "Example: [SAP BTP Documentation](https://help.sap.com/docs/btp) "
-            "not [https://help.sap.com/docs/btp](https://help.sap.com/docs/btp)."
+            "You are BTP Copilot, an intelligent AI assistant that can be embedded in "
+            "ANY SAP Fiori / CAP application. Each session belongs to a DIFFERENT application "
+            "with its own unique entities, terminology and OData services.\n\n"
+
+            "ABSOLUTE RULES — follow every one without exception:\n\n"
+
+            "1. SCHEMA IS GROUND TRUTH\n"
+            "   The user's message begins with '[Context from the Fiori application you are "
+            "embedded in]'. This block contains the OData entity schema for the current app. "
+            "It is the ONLY authoritative source for what entities and fields exist. "
+            "Never rely on prior training knowledge about what an SAP app 'should' have.\n\n"
+
+            "2. NATURAL-LANGUAGE → ENTITY MAPPING\n"
+            "   Users speak in business/domain language, never in technical entity names. "
+            "Your job is semantic mapping:\n"
+            "   • Main transactional objects (blend, order, job, incident, case, ticket, "
+            "record, entry, document) → look for the primary entity in the schema\n"
+            "   • Detail / line items (ingredient, component, material, line, item, part) "
+            "→ look for child / composition entities\n"
+            "   • Reference data (status, priority, type, category, unit) "
+            "→ look for code-list / value-help entities\n"
+            "   • Match by meaning — spelling similarity is irrelevant.\n\n"
+
+            "3. NEVER DENY EXISTENCE\n"
+            "   If any entity in the schema could plausibly match what the user is asking about, "
+            "use it. Only say an entity doesn't exist if the schema is present AND you have "
+            "checked every entity in it and found no reasonable match.\n\n"
+
+            "4. COUNTS & QUERIES\n"
+            "   You cannot directly query the database. For count/list questions, respond with "
+            "the correct OData URL from the schema, e.g.: "
+            "GET {service_url}/{EntitySetName}/$count\n\n"
+
+            "5. STAY IN APP CONTEXT\n"
+            "   Every answer must be grounded in the schema provided. "
+            "Do not import entity names or field names from previous conversations or "
+            "general SAP knowledge — the current app may have completely different entities."
+            + entity_section
         )
+
         if rag_context:
             base += (
-                f"\n\nYou are currently assisting a user inside the '{app_id}' application. "
-                "Use the following retrieved context from that application to answer accurately. "
-                "If the question is general, answer normally. If it's about this application's data "
-                "or entities, prioritise the context below.\n\n"
-                + rag_context
+                f"\n\nAdditional retrieved knowledge for {app_label}:\n\n{rag_context}"
             )
+
         return base
 
-    async def get_response(self, message: str, history: Optional[List[Dict[str, str]]] = None, app_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_response(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
+        odata_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
         self.request_count += 1
         start_time = datetime.utcnow()
 
         rag_context = await self._fetch_rag_context(message, app_id)
-        system_message = self._build_system_message(rag_context, app_id)
+        system_message = self._build_system_message(rag_context, app_id, fiori_context)
+
+        # Fetch real live data from the app's OData service when the user
+        # is asking a data question (counts, lists, records).
+        live_data_block = await self._fetch_real_data(fiori_context, odata_token, message)
+        if live_data_block:
+            message = live_data_block + message
 
         token = await self.auth_client.get_token()
 
@@ -190,9 +642,17 @@ class SAPAICoreAgent:
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         app_id: Optional[str] = None,
+        fiori_context: Optional[Dict[str, Any]] = None,
+        odata_token: Optional[str] = None,
     ):
         """Stream response token-by-token using word-level chunking."""
-        result = await self.get_response(message=message, history=history, app_id=app_id)
+        result = await self.get_response(
+            message=message,
+            history=history,
+            app_id=app_id,
+            fiori_context=fiori_context,
+            odata_token=odata_token,
+        )
         text = result.get("response", "")
         words = text.split(" ")
         for i, word in enumerate(words):
