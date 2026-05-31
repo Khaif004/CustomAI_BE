@@ -401,28 +401,43 @@ def _short_overview_from_data(data: dict, doc_type: str) -> str:
 
     return overview
 
-# Initialize the agent (singleton)
+# Initialize agent router (singleton)
+# The router dispatches to:
+#   GlobalChatAgent   — when no app_id / fiori_context (standalone / global mode)
+#   AppContextAgent   — when app_id or fiori_context is present (embedded Fiori mode)
 try:
     if settings.use_mock_agent:
         logger.warning("MOCK MODE - Using MockChatAgent for testing")
         chat_agent = MockChatAgent()
-    elif settings.llm_provider == "sap_ai_core":
-        logger.info("SAP AI Core mode enabled")
-        if not all([settings.sap_aicore_url, settings.sap_aicore_client_id, settings.sap_aicore_client_secret]):
-            raise ValueError("SAP AI Core requires: SAP_AICORE_URL, SAP_AICORE_CLIENT_ID, SAP_AICORE_CLIENT_SECRET")
-        chat_agent = SAPAICoreAgent(
-            url=settings.sap_aicore_url,
-            client_id=settings.sap_aicore_client_id,
-            client_secret=settings.sap_aicore_client_secret,
-            model_id=settings.sap_aicore_model_id,
-            deployment_id=settings.sap_aicore_deployment_id,
-            auth_url=settings.sap_aicore_auth_url,
-        )
     else:
-        chat_agent = ChatAgent()
-    logger.info("Chat agent initialized successfully")
+        from app.agents.global_agent import GlobalChatAgent
+        from app.agents.router import AgentRouter
+
+        global_agent = GlobalChatAgent()
+
+        if settings.llm_provider == "sap_ai_core":
+            logger.info("SAP AI Core mode — initialising AppContextAgent + GlobalChatAgent")
+            if not all([settings.sap_aicore_url, settings.sap_aicore_client_id, settings.sap_aicore_client_secret]):
+                raise ValueError(
+                    "SAP AI Core requires: SAP_AICORE_URL, SAP_AICORE_CLIENT_ID, SAP_AICORE_CLIENT_SECRET"
+                )
+            app_agent = SAPAICoreAgent(
+                url=settings.sap_aicore_url,
+                client_id=settings.sap_aicore_client_id,
+                client_secret=settings.sap_aicore_client_secret,
+                model_id=settings.sap_aicore_model_id,
+                deployment_id=settings.sap_aicore_deployment_id,
+                auth_url=settings.sap_aicore_auth_url,
+            )
+        else:
+            logger.info("OpenAI mode — initialising AppContextAgent + GlobalChatAgent")
+            app_agent = ChatAgent()
+
+        chat_agent = AgentRouter(global_agent=global_agent, app_agent=app_agent)
+
+    logger.info("Chat agent router initialised successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize chat agent: {e}")
+    logger.error(f"Failed to initialise chat agent router: {e}")
     chat_agent = None
 
 
