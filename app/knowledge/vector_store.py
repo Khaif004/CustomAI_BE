@@ -2,7 +2,6 @@ import logging
 import os
 from typing import List, Dict, Any, Optional
 from langchain_community.vectorstores import Chroma, FAISS
-from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 from app.config import get_settings
 
@@ -10,10 +9,112 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+class SAPAICoreEmbeddings:
+    """
+    LangChain-compatible Embeddings class that calls SAP AI Core's
+    OpenAI-compatible embeddings endpoint:
+      POST /v2/inference/deployments/{id}/embeddings
+    with an OAuth2 Bearer token.
+    """
+
+    def __init__(self, aicore_url: str, auth_url: str, client_id: str,
+                 client_secret: str, deployment_id: str, model: str):
+        import httpx
+        self._httpx = httpx
+        # SAP AI Core foundation-models: correct inference path is /v1/embeddings (not /embeddings).
+        base = aicore_url.rstrip('/')
+        self.embeddings_url = f"{base}/v2/inference/deployments/{deployment_id}/v1/embeddings"
+        self.token_url = (
+            auth_url if auth_url.endswith("/oauth/token")
+            else f"{auth_url}/oauth/token"
+        )
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.model = model
+        self._token = None
+        self._token_expiry = 0
+        logger.info(f"SAP AI Core Embeddings — deployment: {deployment_id}, model: {model}")
+
+    def _get_token(self) -> str:
+        import time
+        if self._token and time.time() < self._token_expiry:
+            return self._token
+        resp = self._httpx.post(
+            self.token_url,
+            data={"client_id": self.client_id, "client_secret": self.client_secret,
+                  "grant_type": "client_credentials"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._token = data["access_token"]
+        self._token_expiry = time.time() + data.get("expires_in", 3600) - 60
+        return self._token
+
+    def _embed(self, texts: list, batch_size: int = 20) -> list:
+        """Embed texts in batches — one API call per batch instead of per text."""
+        token = self._get_token()
+        results = []
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "AI-Resource-Group": "default",
+        }
+        for i in range(0, len(texts), batch_size):
+            batch = [t[:4000] if len(t) > 4000 else t for t in texts[i:i + batch_size]]
+            # /v1/embeddings accepts an array of strings (OpenAI-compatible)
+            resp = self._httpx.post(
+                self.embeddings_url,
+                headers=headers,
+                json={"input": batch},
+                timeout=120,
+            )
+            if not resp.is_success:
+                logger.error(
+                    f"SAP AI Core embeddings {resp.status_code}: {resp.text[:500]}"
+                )
+                resp.raise_for_status()
+            data = resp.json()
+            # Sort by index to preserve order
+            items = sorted(data["data"], key=lambda x: x.get("index", 0))
+            results.extend(item["embedding"] for item in items)
+            logger.debug(f"Embedded batch {i // batch_size + 1}: {len(batch)} texts")
+        return results
+
+    def embed_documents(self, texts: list) -> list:
+        return self._embed(texts)
+
+    def embed_query(self, text: str) -> list:
+        return self._embed([text])[0]
+
+
+def _build_embeddings():
+    """Build the embeddings object based on the configured LLM provider."""
+    if settings.llm_provider == "sap_ai_core" and settings.sap_aicore_url:
+        embedding_deployment = (
+            settings.sap_aicore_embedding_deployment_id or settings.sap_aicore_deployment_id
+        )
+        return SAPAICoreEmbeddings(
+            aicore_url=settings.sap_aicore_url,
+            auth_url=settings.sap_aicore_auth_url,
+            client_id=settings.sap_aicore_client_id,
+            client_secret=settings.sap_aicore_client_secret,
+            deployment_id=embedding_deployment,
+            model=settings.embedding_model,
+        )
+    else:
+        from langchain_openai import OpenAIEmbeddings
+        logger.info(f"Using OpenAI embeddings — model: {settings.embedding_model}")
+        return OpenAIEmbeddings(
+            openai_api_key=settings.openai_api_key,
+            model=settings.embedding_model,
+        )
+
+
 class VectorStoreManager:
 
     def __init__(self):
-        self.embeddings = OpenAIEmbeddings(openai_api_key=settings.openai_api_key, model=settings.embedding_model)
+        self.embeddings = _build_embeddings()
         self.collection_name = settings.vector_store_collection
         self.vector_store = self._initialize_store()
 

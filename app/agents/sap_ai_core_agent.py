@@ -267,13 +267,20 @@ class SAPAICoreAgent:
         schema_hint = (
             (fiori_context.get("extra") or {}).get("schema_hint") or ""
         )
+        # Match headings like "## FertilizerBlend entity schema" OR "## FertilizerBlend"
         raw_entities: list = _re.findall(
-            r"^###?\s+([A-Za-z][A-Za-z0-9_]+)\s*$", schema_hint, _re.MULTILINE
+            r"^###?\s+([A-Za-z][A-Za-z0-9_]+)(?:\s+entity\s+schema)?\s*$",
+            schema_hint, _re.MULTILINE
         )
         entity_names = [
             e for e in raw_entities
-            if not e.lower().startswith("service")
+            if not e.lower().startswith(("service", "available"))
         ]
+        # Fallback: parse "Entities: Foo, Bar, Baz" line from the summary section
+        if not entity_names:
+            m = _re.search(r'^Entities:\s+(.+)$', schema_hint, _re.MULTILINE)
+            if m:
+                entity_names = [e.strip() for e in m.group(1).split(",") if e.strip()]
         if not entity_names:
             return None
 
@@ -407,17 +414,45 @@ class SAPAICoreAgent:
                 if count_val is not None:
                     lines.append(f"Total record count: {count_val}")
                 if rows_data:
-                    lines.append(f"First {len(rows_data)} record(s):")
-                    for i, row in enumerate(rows_data[:5], 1):
-                        preview = {
-                            k: v for k, v in row.items()
-                            if not isinstance(v, (dict, list)) and v is not None
-                        }
-                        # Show expanded nav properties as "(N item(s))"
-                        for k, v in row.items():
-                            if isinstance(v, list) and v is not None:
-                                preview[k] = f"({len(v)} item(s))"
-                        lines.append(f"  {i}. {_json.dumps(preview, default=str)}")
+                    sample = rows_data[:5]
+                    lines.append(f"Sample records ({len(sample)} of {count_val or len(rows_data)}):")
+
+                    # Collect scalar fields, skip UUIDs unless they're the only key
+                    uuid_re = _re.compile(
+                        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+                        _re.IGNORECASE
+                    )
+                    all_keys: list = []
+                    for row in sample:
+                        for k in row:
+                            if k not in all_keys:
+                                all_keys.append(k)
+
+                    # Prefer non-UUID columns; fall back to all if everything is UUID
+                    scalar_keys = [
+                        k for k in all_keys
+                        if not isinstance(sample[0].get(k), (dict, list))
+                        and sample[0].get(k) is not None
+                    ]
+                    meaningful_keys = [
+                        k for k in scalar_keys
+                        if not (
+                            isinstance(sample[0].get(k), str)
+                            and uuid_re.match(str(sample[0].get(k, "")))
+                            and k.lower() not in ("id", "key")
+                        )
+                    ] or scalar_keys
+
+                    # Emit as a simple CSV-style table the LLM can use to build Markdown
+                    if meaningful_keys:
+                        lines.append("| " + " | ".join(meaningful_keys) + " |")
+                        lines.append("|" + "|".join("---" for _ in meaningful_keys) + "|")
+                        for row in sample:
+                            cells = [str(row.get(k, "")) for k in meaningful_keys]
+                            lines.append("| " + " | ".join(cells) + " |")
+                    else:
+                        for i, row in enumerate(sample, 1):
+                            lines.append(f"  {i}. {_json.dumps(row, default=str)}")
             lines.append("[End of live data]\n")
             return "\n".join(lines)
 
@@ -518,10 +553,18 @@ class SAPAICoreAgent:
             "use it. Only say an entity doesn't exist if the schema is present AND you have "
             "checked every entity in it and found no reasonable match.\n\n"
 
-            "4. COUNTS & QUERIES\n"
-            "   You cannot directly query the database. For count/list questions, respond with "
-            "the correct OData URL from the schema, e.g.: "
-            "GET {service_url}/{EntitySetName}/$count\n\n"
+            "4. COUNTS & LIVE DATA\n"
+            "   The user's message may be prefixed with a '[Real data from OData — EntityName]' "
+            "block. When that block is present:\n"
+            "   a) Use the exact numbers from it — do NOT say you cannot query the database.\n"
+            "   b) State the total count naturally (e.g. 'There are 4 fertilizer blends…').\n"
+            "   c) Present the sample records as a **Markdown table** with the most meaningful\n"
+            "      scalar fields as columns (skip internal IDs/UUIDs unless they are the only\n"
+            "      identifier). Example column choice: Status, Name, Date, Amount, etc.\n"
+            "   d) After the table, add 1-2 sentences of brief insight if helpful\n"
+            "      (e.g. breakdown by status, date range, notable values).\n"
+            "   e) If the live data block is absent, provide the correct OData URL:\n"
+            "      GET {service_url}/{EntitySetName}/$count\n\n"
 
             "5. STAY IN APP CONTEXT\n"
             "   Every answer must be grounded in the schema provided. "

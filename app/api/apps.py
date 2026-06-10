@@ -7,17 +7,21 @@
                                can fetch real record counts and data without
                                the user needing to know OData or Postman.
 """
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
 import logging
 import re
 import urllib.parse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
 from app.auth.security import get_current_user
 from app.knowledge.knowledge_base import get_knowledge_base
+
+_reg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="btp-reg")
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/apps", tags=["apps"])
@@ -39,7 +43,7 @@ class AppRegistrationRequest(BaseModel):
         ...,
         description="Context documents: entity schemas, relationship descriptions, business rules, etc.",
         min_length=1,
-        max_length=50,
+        max_length=2000,
     )
     replace: bool = Field(True, description="Replace previously registered documents for this app_id")
 
@@ -52,17 +56,15 @@ class AppRegistrationResponse(BaseModel):
     message: str
 
 
-@router.post("/register", response_model=AppRegistrationResponse, status_code=status.HTTP_200_OK)
+@router.post("/register", response_model=AppRegistrationResponse, status_code=status.HTTP_202_ACCEPTED)
 async def register_app_context(
     request: AppRegistrationRequest,
-    current_user=Depends(get_current_user),
 ):
     """
     Register or update the context for a host application.
 
-    Call this from your app's startup or CI/CD pipeline whenever the
-    schema or business rules change. The content is chunked, embedded,
-    and stored in the vector store under the app's `app_id`.
+    Returns 202 Accepted immediately — embedding and storage happen in a
+    background thread so the chat endpoint is never blocked.
 
     Example payload from Stutsman app:
     ```json
@@ -86,27 +88,37 @@ async def register_app_context(
     }
     ```
     """
-    try:
-        kb = get_knowledge_base()
-        result = kb.register_app_context(
-            app_id=request.app_id,
-            app_name=request.app_name,
-            documents=[{"title": d.title, "content": d.content} for d in request.documents],
-            replace=request.replace,
-        )
-        return AppRegistrationResponse(
-            app_id=request.app_id,
-            app_name=request.app_name,
-            chunks_stored=result["chunks_stored"],
-            docs_received=result["docs_received"],
-            message=f"Context for '{request.app_name}' registered successfully.",
-        )
-    except Exception as e:
-        logger.error(f"App registration failed for '{request.app_id}': {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Registration failed: {str(e)}",
-        )
+    docs = [{"title": d.title, "content": d.content} for d in request.documents]
+    app_id = request.app_id
+    app_name = request.app_name
+    replace = request.replace
+
+    def _do_register():
+        try:
+            kb = get_knowledge_base()
+            result = kb.register_app_context(
+                app_id=app_id,
+                app_name=app_name,
+                documents=docs,
+                replace=replace,
+            )
+            logger.info(
+                f"Background registration complete for '{app_id}': "
+                f"{result['chunks_stored']} chunks from {result['docs_received']} docs"
+            )
+        except Exception as exc:
+            logger.error(f"Background registration failed for '{app_id}': {exc}", exc_info=True)
+
+    # Fire-and-forget in a dedicated thread pool — does NOT block the event loop
+    asyncio.get_event_loop().run_in_executor(_reg_executor, _do_register)
+
+    return AppRegistrationResponse(
+        app_id=app_id,
+        app_name=app_name,
+        chunks_stored=0,
+        docs_received=len(docs),
+        message=f"Accepted — {len(docs)} documents queued for background indexing.",
+    )
 
 
 @router.delete("/{app_id}", status_code=status.HTTP_200_OK)
@@ -278,3 +290,66 @@ async def odata_proxy(
     except Exception as e:
         logger.error(f"OData proxy error: {e}", exc_info=True)
         return ODataProxyResponse(entity_set=entity, error=str(e))
+
+
+# ── Service Tool Registry ──────────────────────────────────────────────────────
+# In-memory map: app_id → { app_name, service_url, entities, registered_at }
+# Survives for the lifetime of the backend process.
+_service_tool_registry: Dict[str, Dict[str, Any]] = {}
+
+
+class ServiceToolRequest(BaseModel):
+    app_id: str = Field(..., pattern=r"^[a-zA-Z0-9_-]+$")
+    app_name: str = Field(...)
+    service_url: str = Field(..., description="Absolute or relative OData service base URL")
+    entities: List[str] = Field(default_factory=list)
+
+
+class ServiceToolResponse(BaseModel):
+    app_id: str
+    service_url: str
+    entities_registered: int
+    message: str
+
+
+@router.post("/register-service-tool", response_model=ServiceToolResponse, status_code=status.HTTP_200_OK)
+async def register_service_tool(request: ServiceToolRequest):
+    """
+    Register a CAP OData service as a live-query tool for the LLM agent.
+
+    Called automatically by cap-copilot-sdk on startup. Stores the mapping
+    so that when the LLM agent handles a query for this app_id it can call
+    the OData service directly for fresh data instead of relying solely on
+    the vector store.
+    """
+    from datetime import datetime, timezone
+
+    _service_tool_registry[request.app_id] = {
+        "app_name": request.app_name,
+        "service_url": request.service_url,
+        "entities": request.entities,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    logger.info(
+        f"Service tool registered — app_id='{request.app_id}' "
+        f"service='{request.service_url}' entities={len(request.entities)}"
+    )
+
+    return ServiceToolResponse(
+        app_id=request.app_id,
+        service_url=request.service_url,
+        entities_registered=len(request.entities),
+        message=f"OData service tool registered with {len(request.entities)} entities.",
+    )
+
+
+@router.get("/service-tools", response_model=Dict[str, Any])
+async def list_service_tools():
+    """Return all currently registered OData service tools."""
+    return _service_tool_registry
+
+
+def get_service_tool(app_id: str) -> Optional[Dict[str, Any]]:
+    """Utility for agents to look up the OData service for a given app."""
+    return _service_tool_registry.get(app_id)

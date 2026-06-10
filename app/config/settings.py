@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     sap_aicore_client_secret: Optional[str] = None
     sap_aicore_model_id: str = "gpt-4o"
     sap_aicore_deployment_id: str = "default"
+    # Separate deployment for text-embedding model (e.g. text-embedding-3-small)
+    # If not set, falls back to sap_aicore_deployment_id
+    sap_aicore_embedding_deployment_id: Optional[str] = None
 
     jwt_secret_key: str = "dev-secret-key-change-in-production"
     jwt_algorithm: str = "HS256"
