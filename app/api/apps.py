@@ -14,6 +14,7 @@ import logging
 import re
 import urllib.parse
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -121,7 +122,70 @@ async def register_app_context(
     )
 
 
-@router.delete("/{app_id}", status_code=status.HTTP_200_OK)
+# ── Metadata XML Registration ─────────────────────────────────────────────────
+
+_METADATA_DIR = os.path.normpath(os.path.join(__file__, "..", "..", "..", "data", "metadata"))
+
+
+class MetadataRegistrationRequest(BaseModel):
+    app_id: str = Field(..., pattern=r"^[a-zA-Z0-9_-]+$")
+    service_url: str = Field(..., description="OData service base URL")
+    raw_xml: str = Field(..., description="Raw $metadata XML fetched by the widget")
+
+
+@router.post("/register-metadata", status_code=status.HTTP_204_NO_CONTENT)
+async def register_metadata(request: MetadataRegistrationRequest):
+    """
+    Store the raw $metadata XML for a service so the agent can inspect it.
+
+    Called by the widget (ContextBridge) once per session — fires in the
+    background and returns immediately without blocking chat.
+    """
+    app_id = request.app_id
+    service_url = request.service_url.rstrip("/")
+    raw_xml = request.raw_xml
+
+    def _slug(url: str) -> str:
+        """Turn a URL into a safe filename slug."""
+        slug = re.sub(r"https?://", "", url)
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", slug)
+        return slug[:120]
+
+    def _save():
+        try:
+            app_dir = os.path.join(_METADATA_DIR, app_id)
+            os.makedirs(app_dir, exist_ok=True)
+            xml_path = os.path.join(app_dir, f"{_slug(service_url)}.xml")
+            with open(xml_path, "w", encoding="utf-8") as fh:
+                fh.write(raw_xml)
+            logger.info(f"[metadata] Saved $metadata XML for '{app_id}' / '{service_url}' → {xml_path}")
+        except Exception as exc:
+            logger.error(f"[metadata] Failed to save XML for '{app_id}': {exc}", exc_info=True)
+
+    asyncio.get_event_loop().run_in_executor(_reg_executor, _save)
+
+
+def load_metadata_xml(app_id: str, service_url: str) -> Optional[str]:
+    """
+    Load the stored $metadata XML for an app + service.
+    Returns None if not found.  Called by the agent at query time.
+    """
+    def _slug(url: str) -> str:
+        slug = re.sub(r"https?://", "", url.rstrip("/"))
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", slug)
+        return slug[:120]
+
+    xml_path = os.path.join(_METADATA_DIR, app_id, f"{_slug(service_url)}.xml")
+    try:
+        with open(xml_path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.error(f"[metadata] Error reading XML at {xml_path}: {exc}")
+        return None
+
+
 async def deregister_app(app_id: str, current_user=Depends(get_current_user)):
     """Remove all stored context for an app."""
     try:
@@ -293,9 +357,10 @@ async def odata_proxy(
 
 
 # ── Service Tool Registry ──────────────────────────────────────────────────────
-# In-memory map: app_id → { app_name, service_url, entities, registered_at }
-# Survives for the lifetime of the backend process.
-_service_tool_registry: Dict[str, Dict[str, Any]] = {}
+# In-memory map: app_id → List[{ app_name, app_base_url, service_url, entities, registered_at }]
+# Each app may have multiple OData services; each service is a separate entry.
+# Rebuilt automatically on every CAP startup — no file persistence needed.
+_service_tool_registry: Dict[str, List[Dict[str, Any]]] = {}
 
 
 class ServiceToolRequest(BaseModel):
@@ -303,6 +368,10 @@ class ServiceToolRequest(BaseModel):
     app_name: str = Field(...)
     service_url: str = Field(..., description="Absolute or relative OData service base URL")
     entities: List[str] = Field(default_factory=list)
+    app_base_url: Optional[str] = Field(
+        None,
+        description="Base URL of the CAP server (e.g. http://localhost:4004) used to resolve relative service_url paths",
+    )
 
 
 class ServiceToolResponse(BaseModel):
@@ -324,12 +393,22 @@ async def register_service_tool(request: ServiceToolRequest):
     """
     from datetime import datetime, timezone
 
-    _service_tool_registry[request.app_id] = {
+    entry = {
         "app_name": request.app_name,
         "service_url": request.service_url,
         "entities": request.entities,
+        "app_base_url": request.app_base_url or "",
         "registered_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Upsert: replace existing entry for this service_url, or append a new one.
+    services = _service_tool_registry.setdefault(request.app_id, [])
+    for i, svc in enumerate(services):
+        if svc.get("service_url") == request.service_url:
+            services[i] = entry
+            break
+    else:
+        services.append(entry)
 
     logger.info(
         f"Service tool registered — app_id='{request.app_id}' "
@@ -351,5 +430,7 @@ async def list_service_tools():
 
 
 def get_service_tool(app_id: str) -> Optional[Dict[str, Any]]:
-    """Utility for agents to look up the OData service for a given app."""
-    return _service_tool_registry.get(app_id)
+    """Utility for agents to look up the first OData service for a given app.
+    Use _service_tool_registry[app_id] directly to iterate all services."""
+    services = _service_tool_registry.get(app_id)
+    return services[0] if services else None

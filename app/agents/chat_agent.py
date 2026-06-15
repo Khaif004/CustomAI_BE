@@ -137,6 +137,8 @@ When including links:
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict[str, Any]] = None,
         odata_token: Optional[str] = None,
+        raw_message: Optional[str] = None,
+        **_kwargs,
     ) -> Dict[str, Any]:
 
         start_time = time.time()
@@ -178,6 +180,8 @@ When including links:
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict[str, Any]] = None,
         odata_token: Optional[str] = None,
+        raw_message: Optional[str] = None,
+        **_kwargs,
     ):
         self.total_requests += 1
         self.last_request_time = time.time()

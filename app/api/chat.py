@@ -405,34 +405,36 @@ def _short_overview_from_data(data: dict, doc_type: str) -> str:
 # The router dispatches to:
 #   GlobalChatAgent   — when no app_id / fiori_context (standalone / global mode)
 #   AppContextAgent   — when app_id or fiori_context is present (embedded Fiori mode)
+#
+# Supports unlimited CAP apps simultaneously — each app registers under its own
+# app_id via POST /api/apps/register-service-tool. The service tool registry
+# (persisted to service_tools.json) is keyed by app_id, so 10 different apps
+# each get their own set of OData service URLs. No per-app config is needed here.
 try:
-    if settings.use_mock_agent:
-        logger.warning("MOCK MODE - Using MockChatAgent for testing")
-        chat_agent = MockChatAgent()
-    else:
+    if settings.llm_provider == "sap_ai_core":
+        logger.info("SAP AI Core mode — initialising AppContextAgent + GlobalChatAgent")
+        if not all([settings.sap_aicore_url, settings.sap_aicore_client_id, settings.sap_aicore_client_secret]):
+            raise ValueError(
+                "SAP AI Core requires: SAP_AICORE_URL, SAP_AICORE_CLIENT_ID, SAP_AICORE_CLIENT_SECRET"
+            )
         from app.agents.global_agent import GlobalChatAgent
         from app.agents.router import AgentRouter
-
         global_agent = GlobalChatAgent()
-
-        if settings.llm_provider == "sap_ai_core":
-            logger.info("SAP AI Core mode — initialising AppContextAgent + GlobalChatAgent")
-            if not all([settings.sap_aicore_url, settings.sap_aicore_client_id, settings.sap_aicore_client_secret]):
-                raise ValueError(
-                    "SAP AI Core requires: SAP_AICORE_URL, SAP_AICORE_CLIENT_ID, SAP_AICORE_CLIENT_SECRET"
-                )
-            app_agent = SAPAICoreAgent(
-                url=settings.sap_aicore_url,
-                client_id=settings.sap_aicore_client_id,
-                client_secret=settings.sap_aicore_client_secret,
-                model_id=settings.sap_aicore_model_id,
-                deployment_id=settings.sap_aicore_deployment_id,
-                auth_url=settings.sap_aicore_auth_url,
-            )
-        else:
-            logger.info("OpenAI mode — initialising AppContextAgent + GlobalChatAgent")
-            app_agent = ChatAgent()
-
+        app_agent = SAPAICoreAgent(
+            url=settings.sap_aicore_url,
+            client_id=settings.sap_aicore_client_id,
+            client_secret=settings.sap_aicore_client_secret,
+            model_id=settings.sap_aicore_model_id,
+            deployment_id=settings.sap_aicore_deployment_id,
+            auth_url=settings.sap_aicore_auth_url,
+        )
+        chat_agent = AgentRouter(global_agent=global_agent, app_agent=app_agent)
+    else:
+        logger.info("OpenAI mode — initialising AppContextAgent + GlobalChatAgent")
+        from app.agents.global_agent import GlobalChatAgent
+        from app.agents.router import AgentRouter
+        global_agent = GlobalChatAgent()
+        app_agent = ChatAgent()
         chat_agent = AgentRouter(global_agent=global_agent, app_agent=app_agent)
 
     logger.info("Chat agent router initialised successfully")
@@ -447,6 +449,14 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
     if chat_agent is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Chat service not available")
 
+    # Extract the authenticated user's identity from the verified JWT.
+    # Prefer user_name (XSUAA) → email → sub (generic JWT sub claim).
+    user_id: str | None = (
+        current_user.get("user_name")
+        or current_user.get("email")
+        or current_user.get("sub")
+    )
+
     try:
         history = None
         if request.conversation_history:
@@ -458,6 +468,7 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
             app_id=request.app_id,
             fiori_context=request.fiori_context,
             odata_token=getattr(request, 'odata_token', None),
+            user_id=user_id,
         )
 
         return ChatResponse(
@@ -477,6 +488,13 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
 async def chat_stream(request: ChatRequest, current_user=Depends(get_current_user)):
     if chat_agent is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Chat service not available")
+
+    # Extract authenticated user identity from the verified JWT.
+    _user_id: str | None = (
+        current_user.get("user_name")
+        or current_user.get("email")
+        or current_user.get("sub")
+    )
 
     async def event_generator():
         try:
@@ -540,6 +558,8 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
                         app_id=request.app_id,
                         fiori_context=request.fiori_context,
                         odata_token=getattr(request, 'odata_token', None),
+                        user_id=_user_id,
+                        raw_message=request.message,
                     ):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
                 else:
@@ -549,6 +569,8 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
                         app_id=request.app_id,
                         fiori_context=request.fiori_context,
                         odata_token=getattr(request, 'odata_token', None),
+                        user_id=_user_id,
+                        raw_message=request.message,
                     )
                     words = result["response"].split(" ")
                     for i, word in enumerate(words):

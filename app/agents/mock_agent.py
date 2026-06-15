@@ -24,7 +24,7 @@ class MockChatAgent:
         self.request_count = 0
         logger.info("Mock Chat Agent initialized (demo mode)")
 
-    async def get_response(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    async def get_response(self, message: str, history: Optional[List[Dict[str, str]]] = None, **_kwargs) -> Dict[str, Any]:
         self.request_count += 1
         start_time = datetime.utcnow()
 
@@ -45,7 +45,7 @@ class MockChatAgent:
 
         return {"response": response_text, "model": "mock-agent", "response_time": response_time}
 
-    async def stream_response(self, message: str, history: Optional[List[Dict[str, str]]] = None):
+    async def stream_response(self, message: str, history: Optional[List[Dict[str, str]]] = None, **_kwargs):
         result = await self.get_response(message, history)
         words = result["response"].split(" ")
         for i, word in enumerate(words):

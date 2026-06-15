@@ -50,6 +50,8 @@ class AgentRouter:
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict] = None,
         odata_token: Optional[str] = None,
+        user_id: Optional[str] = None,
+        raw_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         agent = self._pick_agent(app_id, fiori_context)
         return await agent.get_response(
@@ -58,6 +60,8 @@ class AgentRouter:
             app_id=app_id,
             fiori_context=fiori_context,
             odata_token=odata_token,
+            user_id=user_id,
+            raw_message=raw_message,
         )
 
     async def stream_response(
@@ -67,6 +71,8 @@ class AgentRouter:
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict] = None,
         odata_token: Optional[str] = None,
+        user_id: Optional[str] = None,
+        raw_message: Optional[str] = None,
     ):
         agent = self._pick_agent(app_id, fiori_context)
         async for chunk in agent.stream_response(
@@ -75,6 +81,8 @@ class AgentRouter:
             app_id=app_id,
             fiori_context=fiori_context,
             odata_token=odata_token,
+            user_id=user_id,
+            raw_message=raw_message,
         ):
             yield chunk
 

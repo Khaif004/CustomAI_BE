@@ -131,6 +131,60 @@ class SAPAICoreAgent:
                 assocs.append((nav, tgt))
         return assocs
 
+    def _build_fk_filter(self, message: str, fields: list) -> Optional[str]:
+        """Match a bare number in the message to the most semantically appropriate FK field.
+
+        Handles cases like 'materials for blend 2466' where 'blend' in message
+        matches 'Blend' in the FK field 'to_FertilizerBlend_orderID'.
+        """
+        import re as _re
+        numbers = _re.findall(r'\b(\d{3,})\b', message)
+        if not numbers:
+            return None
+        fk_fields = [
+            f for f in fields
+            if _re.search(r'(?i)(orderID|order_id|_ID|ID|Number)$', f)
+            and f.lower() not in ('id', 'areatype_id', 'crop_id', 'variety_id')
+        ]
+        if not fk_fields:
+            return None
+        msg_lower = message.lower()
+        msg_words = set(_re.split(r'\W+', msg_lower))
+        best_fk = None
+        best_score = 0
+        for fk in fk_fields:
+            parts = [p.lower() for p in _re.split(r'(?<=[a-z])(?=[A-Z])|_|(?<=[A-Z])(?=[A-Z][a-z])', fk) if len(p) > 2]
+            score = sum(
+                1 for p in parts
+                if p in msg_words
+                or any(w.startswith(p[:4]) for w in msg_words if len(w) >= 4 and len(p) >= 4)
+            )
+            if score > best_score:
+                best_score = score
+                best_fk = fk
+        if best_fk and best_score > 0:
+            return f"{best_fk} eq {numbers[0]}"
+        return None
+
+    def _parse_fields_from_rag(self, entity: str, rag_context: str) -> list:
+        """Extract field names for a specific entity from RAG context text."""
+        import re as _re
+        if not rag_context:
+            return []
+        m = _re.search(
+            rf'Entity:\s+{_re.escape(entity)}.*?Available fields:\s+([^\n]+)',
+            rag_context, _re.DOTALL | _re.IGNORECASE,
+        )
+        if m:
+            return [f.strip() for f in m.group(1).split(',') if f.strip()]
+        section_m = _re.search(
+            rf'(?:Entity:\s+|## ){_re.escape(entity)}(.*?)(?=Entity:\s+|^## |\Z)',
+            rag_context, _re.DOTALL | _re.IGNORECASE | _re.MULTILINE,
+        )
+        if section_m:
+            return _re.findall(r'^\s*-\s+(\w+)\s*\(', section_m.group(1), _re.MULTILINE)
+        return []
+
     def _build_filter(self, message: str, fields: list) -> Optional[str]:
         """Build an OData $filter clause from natural language using known field names.
 
@@ -235,6 +289,10 @@ class SAPAICoreAgent:
         fiori_context: Optional[Dict[str, Any]],
         odata_token: Optional[str],
         message: str,
+        user_id: Optional[str] = None,
+        app_id: Optional[str] = None,
+        rag_context: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[str]:
         """
         Detect data-retrieval questions and fetch live data from the app's OData service.
@@ -246,26 +304,89 @@ class SAPAICoreAgent:
           2. Auto $expand   "blends with materials"  → $expand=materials
           3. Python groupby "blends by status"       → group fetched rows in Python
         """
-        if not fiori_context:
-            return None
+        service_url = None
+        schema_hint_override = ""
 
-        service_url = (
-            fiori_context.get("service_url") or fiori_context.get("serviceUrl")
-        )
+        if fiori_context:
+            service_url = (
+                fiori_context.get("service_url") or fiori_context.get("serviceUrl")
+            )
+            logger.debug("[fetch_real_data] fiori_context present, service_url=%s", service_url)
+        else:
+            logger.debug("[fetch_real_data] no fiori_context, will try registry")
+
+        # ── Registry fallback ─────────────────────────────────────────────────
+        # If the widget did NOT forward a service_url (standalone chat, no widget
+        # embedded), fall back to the first registered service for this app_id.
+        # This allows live OData queries even when fiori_context is empty.
+        _registry_base_url = ""  # CAP server base URL stored at registration time
+        if not service_url and app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                services = _service_tool_registry.get(app_id, [])
+                if services:
+                    service_url = services[0].get("service_url", "")
+                    _registry_base_url = services[0].get("app_base_url", "")
+                    logger.info("[fetch_real_data] no widget service_url — fell back to registry: %s", service_url)
+            except Exception:
+                pass
+        elif app_id:
+            # Fetch app_base_url even when we already have a service_url from the widget
+            try:
+                from app.api.apps import _service_tool_registry
+                services = _service_tool_registry.get(app_id, [])
+                if services:
+                    _registry_base_url = services[0].get("app_base_url", "")
+            except Exception:
+                pass
+
         if not service_url:
+            logger.info("[fetch_real_data] no service_url found for app_id=%s — skipping live fetch", app_id)
             return None
 
         import re as _re
+
+        # ── Context extension for very short follow-up messages ───────────────
+        # "for 2466?" after asking about materials → extend with last user message
+        # so entity matching can use the topic from the prior turn.
+        if len(message.strip()) < 35 and history:
+            last_user = next(
+                (h.get('content', '') for h in reversed(history) if h.get('role') == 'user'),
+                None
+            )
+            if last_user and last_user.strip() != message.strip():
+                message = f"{message.strip()} {last_user[:200]}"
+                logger.info("[fetch_real_data] short message extended with history context")
+
         DATA_QUESTION = _re.compile(
-            r"\b(how many|count|total|list|show|get|fetch|all|any|exist|records?|entries|data)"
-            r".*\b",
+            r"\b("
+            r"how many|count|total"
+            r"|list|show|display|give me|tell me"
+            r"|get|fetch|find|search|look"
+            r"|what(?:\s+are|\s+is)?\s+(?:the|all|available)?"
+            r"|available|exist|present"
+            r"|all|any|records?|entries|data|items?"
+            r")",
             _re.IGNORECASE,
         )
         if not DATA_QUESTION.search(message):
             return None
 
+        # ── Extract the PRIMARY NOUN — the main subject of the question ───────
+        # "what are the MATERIALS for..." → primary = "materials"
+        # This is used to boost matching entities whose name contains the subject,
+        # preventing secondary context words ("sales order") from winning.
+        _pn_match = _re.search(
+            r'\b(?:what\s+(?:are\s+)?(?:the\s+)?|show\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'
+            r'|list\s+(?:all\s+)?(?:the\s+)?|get\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'
+            r'|fetch\s+(?:all\s+)?(?:the\s+)?|find\s+(?:all\s+)?(?:the\s+)?)\s*(\w+)',
+            message, _re.IGNORECASE,
+        )
+        _primary_noun = _pn_match.group(1).lower() if _pn_match else None
+
         schema_hint = (
             (fiori_context.get("extra") or {}).get("schema_hint") or ""
+            if fiori_context else ""
         )
         # Match headings like "## FertilizerBlend entity schema" OR "## FertilizerBlend"
         raw_entities: list = _re.findall(
@@ -281,20 +402,116 @@ class SAPAICoreAgent:
             m = _re.search(r'^Entities:\s+(.+)$', schema_hint, _re.MULTILINE)
             if m:
                 entity_names = [e.strip() for e in m.group(1).split(",") if e.strip()]
-        if not entity_names:
+
+        # ── Cross-service entity pool ─────────────────────────────────────────
+        # The widget schema_hint only covers the service currently in view.
+        # Build map:  entity_name → service_url  from the service tool registry,
+        # preferring each entity's "home" service.
+        #
+        # Home-service score: length of the longest service-URL slug that is a
+        # clean PREFIX of the entity slug (handles plural set-names and V1 suffixes).
+        # e.g. "SalesOrders" → entity_base "sales-order" starts with service slug
+        #      "sales-order" (len=11) → score 11, beats "fertilizer-blend" (score 0).
+        def _ent_slug(entity: str) -> str:
+            return _re.sub(r'(?<=[a-z])(?=[A-Z])', '-', entity).lower()
+
+        def _home_score(entity: str, svc_url: str) -> int:
+            entity_base = _ent_slug(entity).rstrip('s')  # normalise plural
+            svc_slug = svc_url.rstrip('/').split('/')[-1].lower()
+            if not svc_slug:
+                return 0
+            if entity_base.startswith(svc_slug) and (
+                len(entity_base) == len(svc_slug)
+                or (len(entity_base) > len(svc_slug) and entity_base[len(svc_slug)] == '-')
+            ):
+                return len(svc_slug)  # longer match = more specific
+            return 0
+
+        _entity_to_service: Dict[str, str] = {}
+        _entity_score: Dict[str, int] = {}      # home-score for current mapping
+        if app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                services = _service_tool_registry.get(app_id, [])
+                for svc in services:
+                    reg_svc_url = svc.get("service_url", "")
+                    for ent in svc.get("entities", []):
+                        score = _home_score(ent, reg_svc_url)
+                        # Overwrite if this service is a better "home" for the entity
+                        if score > _entity_score.get(ent, -1):
+                            _entity_to_service[ent] = reg_svc_url
+                            _entity_score[ent] = score
+            except Exception as e:
+                logger.warning("[fetch_real_data] registry lookup failed: %s", e)
+
+        # Track the original schema_hint service so we can detect cross-service
+        _schema_hint_service = service_url
+
+        # Merge schema_hint entities (current service default) + registry entities
+        all_candidate_entities: list = list(
+            dict.fromkeys(entity_names + list(_entity_to_service.keys()))
+        )
+        if not all_candidate_entities:
             return None
 
-        # ── Entity matching (unchanged) ───────────────────────────────────────
+        # ── Trigram helper for typo-tolerant matching ─────────────────────────
+        def _trigrams(s: str) -> set:
+            s = _re.sub(r'\W+', '', s.lower())
+            return {s[i:i+3] for i in range(len(s) - 2)} if len(s) >= 3 else {s}
+
+        # ── Entity matching — scored across ALL services ───────────────────────
+        # Generic English filler/question words that are never entity names.
+        # DO NOT put app-specific terminology here — derive it dynamically below.
+        _NOISE = {
+            "are", "be", "been", "can", "could", "did", "do", "does", "get",
+            "give", "has", "have", "how", "in", "is", "it", "its", "list",
+            "make", "many", "me", "of", "our", "show", "tell", "that", "the",
+            "them", "there", "these", "this", "those", "to", "total", "us",
+            "was", "were", "what", "which", "who", "will", "with", "would",
+            "all", "any", "each", "fetch", "find", "from", "give", "their",
+        }
+
+        # Dynamically extend noise with words from the app name / app_id so that
+        # e.g. "blending" in "stutsman-blending" or "procurement" in a purchasing
+        # app don't accidentally score against entity names.
+        if app_id:
+            for raw in _re.split(r'[\s\-_]+', app_id):
+                w = raw.lower()
+                if len(w) > 2:
+                    _NOISE.add(w)
+        # Also extract words from app_name stored in the registry
+        if app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                _svcs = _service_tool_registry.get(app_id, [])
+                if _svcs:
+                    _app_name = _svcs[0].get("app_name", "")
+                    for raw in _re.split(r'[\s\-_]+', _app_name):
+                        w = raw.lower()
+                        if len(w) > 2:
+                            _NOISE.add(w)
+            except Exception:
+                pass
         msg_lower = message.lower()
+        msg_words = {w for w in _re.split(r'\W+', msg_lower) if w and w not in _NOISE}
+        # Compute trigrams on the full cleaned message for typo tolerance
+        msg_tris = _trigrams(_re.sub(r'\W+', '', msg_lower))
+
         best_entity: Optional[str] = None
-        for ent in entity_names:
-            if ent.lower() in msg_lower or msg_lower in ent.lower():
+        best_service_url: str = service_url  # default to current widget service
+
+        # Pass 1: exact containment (highest confidence)
+        for ent in all_candidate_entities:
+            if ent.lower() in msg_lower:
                 best_entity = ent
+                best_service_url = _entity_to_service.get(ent, service_url)
                 break
+
+        # Pass 2: combined word-stem overlap + trigram similarity
+        # word_overlap handles normal spelling; trigrams handle typos.
         if not best_entity:
-            msg_words = set(_re.split(r'\W+', msg_lower))
             scored = []
-            for ent in entity_names:
+            for ent in all_candidate_entities:
                 ent_words = set(
                     w.lower()
                     for w in _re.split(r'(?<=[a-z])(?=[A-Z])|_', ent)
@@ -307,25 +524,90 @@ class SAPAICoreAgent:
                     if w.endswith("tion"):  stems.add(w[:-4])
                     if w.endswith("es"):    stems.add(w[:-2])
                     if w.endswith("s"):     stems.add(w[:-1])
-                overlap = sum(
+                word_overlap = sum(
                     1 for mw in msg_words
                     if any(mw.startswith(stem[:4]) or stem.startswith(mw[:4])
                            for stem in stems if len(stem) >= 4)
                 )
-                scored.append((overlap, ent))
+                # Trigram similarity: handles typos like "slaesorders" → SalesOrder
+                ent_tris = _trigrams(ent)
+                tri_sim = len(msg_tris & ent_tris) / max(len(msg_tris | ent_tris), 1)
+
+                # Primary-noun boost: strongly prefer entity whose name directly
+                # contains the main SUBJECT of the question.
+                # Example: "materials for blend 2466" → primary="materials" →
+                # AssignMaterialToBlend gets +20 over SalesOrders even though
+                # "sales order" appears in the message context.
+                primary_boost = 0.0
+                if _primary_noun and len(_primary_noun) >= 4:
+                    pn4 = _primary_noun[:4]
+                    if any(s.startswith(pn4) or pn4.startswith(s[:4]) for s in stems if len(s) >= 4):
+                        primary_boost = 20.0
+
+                score = word_overlap * 3.0 + tri_sim * 10.0 + primary_boost
+                scored.append((score, ent))
             scored.sort(reverse=True)
+            logger.info(
+                "[fetch_real_data] top-5 scores: %s",
+                [(round(s, 2), e) for s, e in scored[:5]]
+            )
             if scored and scored[0][0] > 0:
                 best_entity = scored[0][1]
-        if not best_entity and entity_names:
-            best_entity = entity_names[0]
+                best_service_url = _entity_to_service.get(best_entity, service_url)
+
+        # Pass 3: if nothing scored > 0 across all candidates, don't guess.
+        # Return None so the AI uses RAG context instead of fetching wrong data.
         if not best_entity:
+            logger.info(
+                "[fetch_real_data] no entity matched (score=0 for all %d candidates) — skipping live fetch",
+                len(all_candidate_entities)
+            )
             return None
 
+        # Use whichever service URL the winning entity belongs to
+        service_url = best_service_url
+        _cross_service = (
+            service_url.rstrip("/") != _schema_hint_service.rstrip("/")
+        )
+
+        logger.info(
+            "[fetch_real_data] resolved entity=%s from %s (cross_service=%s)",
+            best_entity, service_url, _cross_service
+        )
+
         # ── Build OData query options from NL ─────────────────────────────────
-        fields = self._parse_entity_fields(best_entity, schema_hint)
-        assocs = self._parse_associations(best_entity, schema_hint)
+        # For cross-service entities, schema_hint doesn't cover their fields.
+        # Fall back to RAG context (which contains schema summaries for ALL entities).
+        if not _cross_service:
+            fields = self._parse_entity_fields(best_entity, schema_hint)
+            assocs = self._parse_associations(best_entity, schema_hint)
+        else:
+            fields = self._parse_fields_from_rag(best_entity, rag_context or "")
+            assocs = []
+
         odata_filter = self._build_filter(message, fields) if fields else None
-        odata_expand = self._build_expand(message, assocs)  if assocs else None
+        if not odata_filter:
+            # FK filter: try to match a bare number in the message to a FK field
+            odata_filter = self._build_fk_filter(message, fields) if fields else None
+        odata_expand = self._build_expand(message, assocs) if assocs else None
+
+        # ── User-scoped filter: "my ...", "I have ...", "assigned to me" ───────
+        # When the user mentions ownership language AND we know who they are,
+        # add a createdBy/owner filter so the AI sees only their own records.
+        # CAP managed entities always populate `createdBy` with the user_name from JWT.
+        _MY_INTENT = _re.compile(
+            r"\b(my|mine|i\s+have|i\s+created|i\s+made|assigned\s+to\s+me|my\s+own)\b",
+            _re.IGNORECASE,
+        )
+        if user_id and _MY_INTENT.search(message) and fields:
+            # Prefer `createdBy` (CAP managed), then generic owner synonyms
+            owner_field = next(
+                (f for f in fields if f.lower() in ("createdby", "owner", "assignedto", "userid", "createdbyuser")),
+                None,
+            )
+            if owner_field:
+                user_filter = f"{owner_field} eq '{user_id}'"
+                odata_filter = f"{odata_filter} and {user_filter}" if odata_filter else user_filter
 
         # Aggregation intent: "by status", "per category", "grouped by type"
         AGG_PAT = _re.compile(
@@ -336,8 +618,16 @@ class SAPAICoreAgent:
         group_field: Optional[str] = agg_match.group(1) if agg_match else None
 
         # ── Resolve relative URL ──────────────────────────────────────────────
+        # Use the app_base_url stored at registration time (e.g. http://localhost:4004).
+        # Falls back to localhost:4004 only when the SDK pre-dates app_base_url support.
         if service_url.startswith("/"):
-            service_url = f"http://localhost:4004{service_url}"
+            base = _registry_base_url.rstrip("/") if _registry_base_url else "http://localhost:4004"
+            service_url = f"{base}{service_url}"
+
+        logger.info(
+            "[fetch_real_data] entity=%s service=%s filter=%s expand=%s",
+            best_entity, service_url, odata_filter, odata_expand
+        )
 
         try:
             import aiohttp as _aio
@@ -354,8 +644,8 @@ class SAPAICoreAgent:
             rows_data = None
 
             async with _aio.ClientSession() as session:
-                # Aggregation needs a larger sample; otherwise 5 rows is enough
-                top = 200 if group_field else 5
+                # Aggregation needs a larger sample; otherwise fetch up to 20 rows
+                top = 200 if group_field else 20
                 list_params: dict = {"$top": top}
                 if odata_filter:
                     list_params["$filter"] = odata_filter
@@ -478,6 +768,7 @@ class SAPAICoreAgent:
         rag_context: Optional[str] = None,
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
     ) -> str:
         import re as _re
 
@@ -498,6 +789,20 @@ class SAPAICoreAgent:
             extra = fiori_context.get("extra") or {}
             if isinstance(extra, dict):
                 schema_hint = extra.get("schema_hint")
+
+        # ── Optionally load stored raw $metadata XML for deeper schema context ─
+        raw_xml_section = ""
+        if app_id and service_url:
+            try:
+                from app.api.apps import load_metadata_xml
+                raw_xml = load_metadata_xml(app_id, service_url)
+                if raw_xml and len(raw_xml) < 300_000:  # safety cap: skip absurdly large XMLs
+                    raw_xml_section = (
+                        "\n\n[Raw $metadata XML — use only for deep schema inspection]\n"
+                        f"```xml\n{raw_xml[:50_000]}\n```"  # cap at 50 KB to stay within context window
+                    )
+            except Exception:
+                pass
 
         # ── Parse entity names from schema_hint (lines starting with ##) ─────
         entity_names: list[str] = []
@@ -553,6 +858,14 @@ class SAPAICoreAgent:
             "use it. Only say an entity doesn't exist if the schema is present AND you have "
             "checked every entity in it and found no reasonable match.\n\n"
 
+            "3b. NEVER FABRICATE DATA\n"
+            "   If no '[Real data from OData]' block is present in the message, do NOT invent "
+            "example rows, fake record IDs, fake field values, or placeholder tables. "
+            "This is the MOST IMPORTANT rule — making up data destroys user trust. "
+            "If the live data block is absent, say: "
+            "'I wasn't able to retrieve the live data for this. Please try again in a moment.' "
+            "Do NOT give the user raw OData query URLs — users are business users, not developers.\n\n"
+
             "4. COUNTS & LIVE DATA\n"
             "   The user's message may be prefixed with a '[Real data from OData — EntityName]' "
             "block. When that block is present:\n"
@@ -563,20 +876,43 @@ class SAPAICoreAgent:
             "      identifier). Example column choice: Status, Name, Date, Amount, etc.\n"
             "   d) After the table, add 1-2 sentences of brief insight if helpful\n"
             "      (e.g. breakdown by status, date range, notable values).\n"
-            "   e) If the live data block is absent, provide the correct OData URL:\n"
-            "      GET {service_url}/{EntitySetName}/$count\n\n"
+            "   e) If the live data block is absent, say the data is temporarily unavailable "
+            "and ask the user to try again.\n\n"
 
             "5. STAY IN APP CONTEXT\n"
             "   Every answer must be grounded in the schema provided. "
             "Do not import entity names or field names from previous conversations or "
             "general SAP knowledge — the current app may have completely different entities."
             + entity_section
+            + (
+                f"\n\n6. CURRENT USER\n"
+                f"   The authenticated user is: {user_id}.\n"
+                "   When the user says 'my', 'mine', 'I created' or similar, this refers to "
+                f"records where the owner/createdBy field equals '{user_id}'.\n"
+                "   The live-data block above is already filtered to this user's records when ownership intent was detected."
+                if user_id else ""
+            )
+            + "\n\n"
+
+            "RESPONSE FORMAT RULES (always apply):\n"
+            "  • Lead with the direct answer — never start with 'Sure!' / 'Great!' / 'Of course!'.\n"
+            "  • Use **Markdown tables** for any set of records (>1 row).\n"
+            "  • Use numbered lists for ordered steps; bullet points for unordered options.\n"
+            "  • Use **bold** for entity/field names and key values.\n"
+            "  • Keep responses concise. Expand only if the user asked for detail.\n"
+            "  • When you show a count, follow with a one-line summary (e.g. breakdown by status).\n"
+            "  • Never repeat the user's question back to them.\n"
+            "  • Do not add disclaimers like 'I don't have access to real-time data' when a "
+            "[Real data from OData] block is present — you clearly DO have real data."
         )
 
         if rag_context:
             base += (
                 f"\n\nAdditional retrieved knowledge for {app_label}:\n\n{rag_context}"
             )
+
+        if raw_xml_section:
+            base += raw_xml_section
 
         return base
 
@@ -587,16 +923,27 @@ class SAPAICoreAgent:
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict[str, Any]] = None,
         odata_token: Optional[str] = None,
+        user_id: Optional[str] = None,
+        raw_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.request_count += 1
         start_time = datetime.utcnow()
 
         rag_context = await self._fetch_rag_context(message, app_id)
-        system_message = self._build_system_message(rag_context, app_id, fiori_context)
+        system_message = self._build_system_message(rag_context, app_id, fiori_context, user_id)
 
         # Fetch real live data from the app's OData service when the user
         # is asking a data question (counts, lists, records).
-        live_data_block = await self._fetch_real_data(fiori_context, odata_token, message)
+        # Use raw_message (stripped of the fiori context prefix) for entity
+        # matching so that e.g. "View: FertilizerBlend" in the prefix does
+        # not fool Pass 1 into picking FertilizerBlend for every query.
+        _match_msg = raw_message if raw_message else message
+        live_data_block = await self._fetch_real_data(
+            fiori_context, odata_token, _match_msg,
+            user_id, app_id,
+            rag_context=rag_context,
+            history=history,
+        )
         if live_data_block:
             message = live_data_block + message
 
@@ -687,6 +1034,8 @@ class SAPAICoreAgent:
         app_id: Optional[str] = None,
         fiori_context: Optional[Dict[str, Any]] = None,
         odata_token: Optional[str] = None,
+        user_id: Optional[str] = None,
+        raw_message: Optional[str] = None,
     ):
         """Stream response token-by-token using word-level chunking."""
         result = await self.get_response(
@@ -695,6 +1044,8 @@ class SAPAICoreAgent:
             app_id=app_id,
             fiori_context=fiori_context,
             odata_token=odata_token,
+            user_id=user_id,
+            raw_message=raw_message,
         )
         text = result.get("response", "")
         words = text.split(" ")
