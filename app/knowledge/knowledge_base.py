@@ -62,15 +62,9 @@ class KnowledgeBaseManager:
         return {"app_id": app_id, "chunks_stored": len(chunks), "docs_received": len(documents)}
 
     def _delete_by_app_id(self, app_id: str):
-        """Delete all stored chunks for a given app_id (Chroma only)."""
+        """Delete all stored documents and embeddings for an app."""
         try:
-            if settings.vector_store_type == "chroma":
-                col = self.vector_store.vector_store._collection
-                results = col.get(where={"app_id": app_id})
-                ids = results.get("ids", [])
-                if ids:
-                    col.delete(ids=ids)
-                    logger.info(f"Deleted {len(ids)} old chunks for app '{app_id}'")
+            self.vector_store.delete(app_id)
         except Exception as e:
             logger.warning(f"Could not delete old chunks for app '{app_id}': {e}")
 

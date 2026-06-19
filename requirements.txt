@@ -10,9 +10,8 @@ langchain-openai>=1.0.0
 langchain-community>=0.2.0
 langgraph>=0.1.0
 
-# Vector Databases
-chromadb>=0.5.0
-faiss-cpu>=1.8.0
+psycopg2-binary>=2.9.9
+pgvector>=0.3.0
 
 # Data & Utilities
 pydantic>=2.7.0

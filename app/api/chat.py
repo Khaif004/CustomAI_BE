@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Request, status, Depends, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from app.models.chat import ChatRequest, ChatResponse, AgentStatus
 from app.agents.chat_agent import ChatAgent
@@ -444,7 +444,7 @@ except Exception as e:
 
 
 @router.post("/", response_model=ChatResponse, status_code=status.HTTP_200_OK)
-async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> ChatResponse:
+async def chat(request: ChatRequest, http_request: Request, current_user=Depends(get_current_user)) -> ChatResponse:
     """Send a message and get a response (requires auth)"""
     if chat_agent is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Chat service not available")
@@ -462,6 +462,7 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
         if request.conversation_history:
             history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
 
+        _backend_url = str(http_request.base_url).rstrip("/")
         result = await chat_agent.get_response(
             message=request.message,
             history=history,
@@ -469,6 +470,7 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
             fiori_context=request.fiori_context,
             odata_token=getattr(request, 'odata_token', None),
             user_id=user_id,
+            backend_url=_backend_url,
         )
 
         return ChatResponse(
@@ -485,7 +487,7 @@ async def chat(request: ChatRequest, current_user=Depends(get_current_user)) -> 
 
 
 @router.post("/stream")
-async def chat_stream(request: ChatRequest, current_user=Depends(get_current_user)):
+async def chat_stream(request: ChatRequest, http_request: Request, current_user=Depends(get_current_user)):
     if chat_agent is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Chat service not available")
 
@@ -496,6 +498,8 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
         or current_user.get("sub")
     )
 
+    _backend_url = str(http_request.base_url).rstrip("/")
+
     async def event_generator():
         try:
             history = None
@@ -504,7 +508,8 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
 
             start_time = time.time()
             enriched_message = _enrich_message_with_fiori_context(request.message, request.fiori_context)
-            doc_type = await _classify_doc_intent(enriched_message)
+
+            doc_type = await _classify_doc_intent(request.message)
             model_name = (
                 getattr(getattr(chat_agent, 'llm', None), 'model_name', None)
                 or getattr(chat_agent, 'model_id', 'unknown')
@@ -517,7 +522,24 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
 
                 try:
                     from app.api.documents import _get_document_content, BUILDERS, EXTENSIONS
-                    data = await _get_document_content(enriched_message, doc_type, None)
+
+                    # Build additional context from conversation history so the LLM
+                    # has the live OData data that was shown in the previous turn.
+                    _doc_ctx_parts = []
+                    if history:
+                        for _hm in history[-8:]:
+                            _role = _hm.get("role", "user").upper()
+                            _content = (_hm.get("content") or "")[:3000]
+                            _doc_ctx_parts.append(f"{_role}: {_content}")
+                    # Include current screen entity data (e.g. orderID=2466)
+                    _entity_data = (request.fiori_context or {}).get("entity_data") or {}
+                    if _entity_data:
+                        _doc_ctx_parts.append(
+                            f"CURRENT SCREEN RECORD: {json.dumps(_entity_data)[:800]}"
+                        )
+                    _doc_additional_context = "\n\n".join(_doc_ctx_parts) or None
+
+                    data = await _get_document_content(request.message, doc_type, _doc_additional_context)
 
                     # 2. Stream a short overview (no extra LLM call)
                     overview = _short_overview_from_data(data, doc_type)
@@ -560,6 +582,7 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
                         odata_token=getattr(request, 'odata_token', None),
                         user_id=_user_id,
                         raw_message=request.message,
+                        backend_url=_backend_url,
                     ):
                         yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
                 else:
@@ -571,6 +594,7 @@ async def chat_stream(request: ChatRequest, current_user=Depends(get_current_use
                         odata_token=getattr(request, 'odata_token', None),
                         user_id=_user_id,
                         raw_message=request.message,
+                        backend_url=_backend_url,
                     )
                     words = result["response"].split(" ")
                     for i, word in enumerate(words):

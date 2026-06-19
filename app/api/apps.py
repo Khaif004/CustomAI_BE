@@ -358,9 +358,129 @@ async def odata_proxy(
 
 # ── Service Tool Registry ──────────────────────────────────────────────────────
 # In-memory map: app_id → List[{ app_name, app_base_url, service_url, entities, registered_at }]
-# Each app may have multiple OData services; each service is a separate entry.
-# Rebuilt automatically on every CAP startup — no file persistence needed.
+# Persisted to Neon PostgreSQL so restarts don't lose registrations.
+# CAP apps re-register on every startup anyway, but this covers the gap
+# between backend restart and the first CAP app health-check.
 _service_tool_registry: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _neon_conn():
+    """Return a psycopg2 connection to Neon, or None if not configured."""
+    try:
+        from app.config import get_settings as _gs
+        db_url = _gs().neon_db_url
+        if not db_url:
+            return None
+        import psycopg2
+        return psycopg2.connect(db_url)
+    except Exception as e:
+        logger.warning(f"[registry] Neon connection unavailable: {e}")
+        return None
+
+
+def _persist_service_tool(app_id: str, entry: Dict[str, Any]) -> None:
+    """Persist a service tool entry to Neon PostgreSQL (best-effort, never raises)."""
+    conn = _neon_conn()
+    if not conn:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Upsert application
+                cur.execute(
+                    """
+                    INSERT INTO applications (application_key, name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (application_key) DO UPDATE
+                        SET name = EXCLUDED.name, updated_at = NOW()
+                    RETURNING id
+                    """,
+                    (app_id, entry.get("app_name", app_id)),
+                )
+                app_uuid = str(cur.fetchone()[0])
+
+                # Delete existing service entry for this URL (replace approach)
+                service_url = entry.get("service_url", "")
+                cur.execute(
+                    "DELETE FROM services WHERE application_id = %s AND service_url = %s",
+                    (app_uuid, service_url),
+                )
+
+                # Insert new service row (service_namespace stores app_base_url)
+                cur.execute(
+                    """
+                    INSERT INTO services (application_id, service_url, service_name, service_namespace)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (app_uuid, service_url, entry.get("app_name", app_id),
+                     entry.get("app_base_url", "")),
+                )
+                svc_uuid = str(cur.fetchone()[0])
+
+                # Insert entity rows
+                for ent in entry.get("entities", []):
+                    cur.execute(
+                        "INSERT INTO entities (service_id, entity_name) VALUES (%s, %s)",
+                        (svc_uuid, ent),
+                    )
+
+        logger.debug(f"[registry] Persisted service tool for '{app_id}' / '{service_url}'")
+    except Exception as e:
+        logger.warning(f"[registry] Failed to persist service tool for '{app_id}': {e}")
+    finally:
+        conn.close()
+
+
+def load_service_registry_from_db() -> None:
+    """
+    Populate _service_tool_registry from Neon PostgreSQL on startup.
+    Safe to call multiple times — in-memory entries already present are kept.
+    """
+    conn = _neon_conn()
+    if not conn:
+        logger.info("[registry] Neon not configured — skipping DB load.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.application_key, a.name,
+                       s.id, s.service_url, s.service_namespace, s.created_at
+                FROM applications a
+                JOIN services s ON s.application_id = a.id
+                ORDER BY a.application_key, s.created_at
+                """
+            )
+            rows = cur.fetchall()
+
+            loaded = 0
+            for app_key, app_name, svc_id, svc_url, base_url, reg_at in rows:
+                # Load entities for this service
+                cur.execute(
+                    "SELECT entity_name FROM entities WHERE service_id = %s", (svc_id,)
+                )
+                entities = [r[0] for r in cur.fetchall()]
+
+                entry = {
+                    "app_name": app_name or app_key,
+                    "service_url": svc_url or "",
+                    "entities": entities,
+                    "app_base_url": base_url or "",
+                    "registered_at": reg_at.isoformat() if reg_at else "",
+                }
+
+                services = _service_tool_registry.setdefault(app_key, [])
+                # Only add if not already present from a live registration
+                if not any(s.get("service_url") == svc_url for s in services):
+                    services.append(entry)
+                    loaded += 1
+
+        logger.info(f"[registry] Loaded {loaded} service tool entries from Neon DB.")
+    except Exception as e:
+        logger.warning(f"[registry] Could not load registry from DB: {e}")
+    finally:
+        conn.close()
 
 
 class ServiceToolRequest(BaseModel):
@@ -371,6 +491,10 @@ class ServiceToolRequest(BaseModel):
     app_base_url: Optional[str] = Field(
         None,
         description="Base URL of the CAP server (e.g. http://localhost:4004) used to resolve relative service_url paths",
+    )
+    entity_fields: Optional[Dict[str, List[str]]] = Field(
+        None,
+        description="Map of entity name → list of field names. Sent by cap-plugin so the agent can build OData $filter clauses without needing to parse RAG chunks.",
     )
 
 
@@ -397,6 +521,7 @@ async def register_service_tool(request: ServiceToolRequest):
         "app_name": request.app_name,
         "service_url": request.service_url,
         "entities": request.entities,
+        "entity_fields": request.entity_fields or {},
         "app_base_url": request.app_base_url or "",
         "registered_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -413,6 +538,11 @@ async def register_service_tool(request: ServiceToolRequest):
     logger.info(
         f"Service tool registered — app_id='{request.app_id}' "
         f"service='{request.service_url}' entities={len(request.entities)}"
+    )
+
+    # Persist to Neon DB so the registry survives backend restarts
+    asyncio.get_event_loop().run_in_executor(
+        _reg_executor, _persist_service_tool, request.app_id, entry
     )
 
     return ServiceToolResponse(

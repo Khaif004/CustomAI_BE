@@ -136,24 +136,48 @@ class SAPAICoreAgent:
 
         Handles cases like 'materials for blend 2466' where 'blend' in message
         matches 'Blend' in the FK field 'to_FertilizerBlend_orderID'.
+
+        CAP naming rule: FK fields from parent entities are always named
+        'to_<ParentEntity>_<key>' — these are tried first and exclusively
+        when present, preventing PK fields (e.g. assignMaterialBlendID) from
+        being scored as FK candidates.
         """
         import re as _re
         numbers = _re.findall(r'\b(\d{3,})\b', message)
         if not numbers:
             return None
-        fk_fields = [
+
+        # Separate CAP-style "to_*" FK fields from other numeric-identifier fields.
+        # Prefer "to_*" exclusively: they are unambiguous parent FKs by convention,
+        # unlike PK fields (e.g. assignMaterialBlendID) which also end with "ID".
+        to_fk = [
             f for f in fields
-            if _re.search(r'(?i)(orderID|order_id|_ID|ID|Number)$', f)
+            if _re.match(r'(?i)to_', f)
+            and _re.search(r'(?i)(orderID|order_id|_ID|ID|Number)$', f)
+        ]
+        other_fk = [
+            f for f in fields
+            if not _re.match(r'(?i)to_', f)
+            and _re.search(r'(?i)(orderID|order_id|_ID|ID|Number)$', f)
             and f.lower() not in ('id', 'areatype_id', 'crop_id', 'variety_id')
         ]
+
+        fk_fields = to_fk if to_fk else other_fk
         if not fk_fields:
             return None
+
         msg_lower = message.lower()
         msg_words = set(_re.split(r'\W+', msg_lower))
         best_fk = None
-        best_score = 0
+        best_score = -1
         for fk in fk_fields:
-            parts = [p.lower() for p in _re.split(r'(?<=[a-z])(?=[A-Z])|_|(?<=[A-Z])(?=[A-Z][a-z])', fk) if len(p) > 2]
+
+            if _re.match(r'(?i)to_', fk):
+                m = _re.match(r'(?i)to_(.+)_\w+$', fk)
+                score_target = m.group(1) if m else fk
+            else:
+                score_target = fk
+            parts = [p.lower() for p in _re.split(r'(?<=[a-z])(?=[A-Z])|_|(?<=[A-Z])(?=[A-Z][a-z])', score_target) if len(p) > 2]
             score = sum(
                 1 for p in parts
                 if p in msg_words
@@ -162,28 +186,250 @@ class SAPAICoreAgent:
             if score > best_score:
                 best_score = score
                 best_fk = fk
-        if best_fk and best_score > 0:
-            return f"{best_fk} eq {numbers[0]}"
+
+        if best_fk:
+            # String-typed fields in CAP: salesOrderNumber, any field ending in
+            # 'Number', 'Name', 'Code', 'Key', 'Text' need single-quoted values.
+            _needs_quotes = _re.search(
+                r'(?i)(Number|Name|Code|Key|Text|Description|Ref|Reference)$', best_fk
+            )
+            val = numbers[0]
+            return f"{best_fk} eq '{val}'" if _needs_quotes else f"{best_fk} eq {val}"
         return None
 
+    def _build_context_filter(
+        self,
+        target_fields: list,
+        entity_data: dict,
+        current_view: str,
+    ) -> Optional[str]:
+        
+        import re as _re
+        if not entity_data or not target_fields:
+            return None
+
+        # Infer current entity name from URL hash, e.g. "#/FertilizerBlend/2466"
+        _view_entity: Optional[str] = None
+        for pat in [
+            r'[/#]([A-Z][A-Za-z0-9]+)[/#?]',
+            r'[/#]([A-Z][A-Za-z0-9]+)\(',
+        ]:
+            m = _re.search(pat, current_view or "")
+            if m:
+                _view_entity = m.group(1)
+                break
+
+        # Collect key-like fields from entity_data (integer IDs preferred)
+        _key_candidates: list = []
+        for k, v in entity_data.items():
+            if v is None:
+                continue
+            k_lower = k.lower()
+            if k_lower.endswith(("id", "key", "number", "no", "code")):
+                _key_candidates.append((k, v))
+        # Also include bare integers not already listed
+        for k, v in entity_data.items():
+            if isinstance(v, int) and (k, v) not in _key_candidates:
+                _key_candidates.append((k, v))
+
+        def _val_str(v) -> str:
+            if isinstance(v, float) and v == int(v):
+                return str(int(v))
+            return str(v)
+
+        for fk_field in target_fields:
+            fk_lower = fk_field.lower()
+
+            # Pass 1: FK field name contains the current view entity name.
+            # e.g. to_FertilizerBlend_orderID when viewing FertilizerBlend
+            if _view_entity and _view_entity.lower() in fk_lower and "_" in fk_field:
+                key_part = fk_field.split("_")[-1]
+                for ed_k, ed_v in entity_data.items():
+                    if ed_k.lower() == key_part.lower() and ed_v is not None:
+                        if isinstance(ed_v, (int, float)):
+                            return f"{fk_field} eq {_val_str(ed_v)}"
+                        return f"{fk_field} eq '{ed_v}'"
+
+            # Pass 2: FK field name matches an entity_data key exactly.
+            # e.g. entity_data has 'salesOrderNumber' and FK is 'salesOrderNumber'
+            for ed_k, ed_v in _key_candidates:
+                if fk_lower == ed_k.lower():
+                    if isinstance(ed_v, (int, float)):
+                        return f"{fk_field} eq {_val_str(ed_v)}"
+                    return f"{fk_field} eq '{ed_v}'"
+
+        # Pass 3: cross-entity FK — target entity belongs to a DIFFERENT service
+        # than the current view entity (e.g. viewing FertilizerBlend but fetching
+        # SalesOrderItem whose FK is to_SalesOrder_salesOrderNumber).
+        # No name-based match is possible, so use the first registered to_* FK
+        # field together with the most prominent entity_data key value.
+        # Quoting is applied correctly based on the FK field name suffix.
+        to_fk_fields = [
+            f for f in target_fields
+            if _re.match(r'(?i)to_', f) and "_" in f[3:]
+        ]
+        if to_fk_fields and _key_candidates:
+            fk_field = to_fk_fields[0]
+            _, val = _key_candidates[0]
+            _needs_quotes = _re.search(
+                r'(?i)(Number|Name|Code|Key|Text|Description|Ref|Reference)$', fk_field
+            )
+            val_s = _val_str(val)
+            logger.info(
+                "[context_filter] pass 3 cross-entity: using fk=%s val=%s quoted=%s",
+                fk_field, val_s, bool(_needs_quotes),
+            )
+            return f"{fk_field} eq '{val_s}'" if _needs_quotes else f"{fk_field} eq {val_s}"
+
+        return None
+
+    def _parse_keys_from_view_url(self, current_view: str) -> dict:
+        """Extract key-value pairs from a Fiori hash URL such as
+        '#/FertilizerBlend(orderID=2414,IsActiveEntity=true)'.
+        Returns a dict of numeric/string keys (booleans and 'null' are skipped).
+        """
+        import re as _re
+        result: dict = {}
+        m = _re.search(r'[/#]([A-Z][A-Za-z0-9]+)\(([^)]+)\)', current_view or "")
+        if not m:
+            return result
+        for pair in m.group(2).split(','):
+            pair = pair.strip()
+            if '=' not in pair:
+                continue
+            k, _, v = pair.partition('=')
+            k, v = k.strip(), v.strip()
+            if v.lower() in ('true', 'false', 'null', ''):
+                continue
+            try:
+                result[k] = int(v)
+            except ValueError:
+                try:
+                    result[k] = float(v)
+                except ValueError:
+                    result[k] = v
+        return result
+
+    def _build_context_filter_from_view(
+        self,
+        entity_data: dict,
+        current_view: str,
+    ) -> Optional[str]:
+        """Infer an OData FK filter using CAP naming convention when the field list
+        is unavailable (cross-service entity).  Given URL hash #/FertilizerBlend/1856
+        and entity_data {orderID: 1856}, produces:  to_FertilizerBlend_orderID eq 1856
+        """
+        import re as _re
+        if not entity_data or not current_view:
+            return None
+
+        _view_entity: Optional[str] = None
+        for pat in [r'[/#]([A-Z][A-Za-z0-9]+)[/#?]', r'[/#]([A-Z][A-Za-z0-9]+)\(']:
+            m = _re.search(pat, current_view)
+            if m:
+                _view_entity = m.group(1)
+                break
+        if not _view_entity:
+            return None
+
+        def _val_str(v) -> str:
+            if isinstance(v, float) and v == int(v):
+                return str(int(v))
+            return str(v)
+
+        def _try_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        # Prefer fields whose name ends with id/key/number/no, then bare ints
+        key_candidates: list = []
+        for k, v in entity_data.items():
+            if v is None or k.startswith("_"):
+                continue
+            if k.lower().endswith(("id", "key", "number", "no")):
+                key_candidates.append((k, v))
+        for k, v in entity_data.items():
+            if isinstance(v, int) and not k.startswith("_") and (k, v) not in key_candidates:
+                key_candidates.append((k, v))
+
+        if not key_candidates:
+            return None
+
+        ed_k, ed_v = key_candidates[0]
+        fk_field = f"to_{_view_entity}_{ed_k}"
+        if isinstance(ed_v, (int, float)):
+            return f"{fk_field} eq {_val_str(ed_v)}"
+        iv = _try_int(ed_v)
+        if iv is not None:
+            return f"{fk_field} eq {iv}"
+        return f"{fk_field} eq '{ed_v}'"
+
     def _parse_fields_from_rag(self, entity: str, rag_context: str) -> list:
-        """Extract field names for a specific entity from RAG context text."""
+        """Extract field names for a specific entity from RAG context text.
+
+        Handles three source formats:
+          • SchemaExtractor  — 'Entity: Name\\nFields: f1 (Type), f2 (Type)'
+          • ODataProbe       — '## Name entity schema\\n- f1 (Type)\\n- f2 (Type)'
+          • Legacy           — 'Entity: Name ... Available fields: f1, f2'
+        Also extracts FK fields from query-guidance lines emitted by SchemaExtractor:
+          '$filter=to_FertilizerBlend_orderID%20eq%20<numericValue>'
+        """
         import re as _re
         if not rag_context:
             return []
-        m = _re.search(
-            rf'Entity:\s+{_re.escape(entity)}.*?Available fields:\s+([^\n]+)',
-            rag_context, _re.DOTALL | _re.IGNORECASE,
-        )
-        if m:
-            return [f.strip() for f in m.group(1).split(',') if f.strip()]
+
+        # ── Locate the entity section ────────────────────────────────────────
+        # Match either:
+        #   "[title label] Entity: EntityName"  (RAG context wraps each chunk with a label)
+        #   "Entity: EntityName"                (plain SchemaExtractor)
+        #   "## EntityName ..." or "## Entity: EntityName"  (ODataProbe / markdown)
         section_m = _re.search(
-            rf'(?:Entity:\s+|## ){_re.escape(entity)}(.*?)(?=Entity:\s+|^## |\Z)',
-            rag_context, _re.DOTALL | _re.IGNORECASE | _re.MULTILINE,
+            rf'(?:^|\n)(?:\[[^\]]*\]\s*)?Entity:\s+{_re.escape(entity)}\b'
+            rf'(.*?)'
+            rf'(?=(?:\n|\A)(?:\[[^\]]*\]\s*)?Entity:\s+[A-Z]|^##\s|\Z)',
+            rag_context, _re.DOTALL | _re.IGNORECASE,
+        ) or _re.search(
+            rf'^##\s+(?:Entity:\s+)?{_re.escape(entity)}(?:\s+entity\s+schema)?\s*$'
+            rf'(.*?)'
+            rf'(?=^##\s|\Z)',
+            rag_context, _re.MULTILINE | _re.DOTALL,
         )
-        if section_m:
-            return _re.findall(r'^\s*-\s+(\w+)\s*\(', section_m.group(1), _re.MULTILINE)
-        return []
+        if not section_m:
+            return []
+
+        section = section_m.group(1)
+        fields: list = []
+
+        # 1. "Fields: f1 (Type), f2 (Type)" and "Key fields: f1 (Type, key)" (SchemaExtractor)
+        for line in section.splitlines():
+            m = _re.match(
+                r'^(?:Fields|Key\s+fields|Key\s+field|Available\s+fields):\s+(.+)$',
+                line.strip(), _re.IGNORECASE,
+            )
+            if m:
+                for item in m.group(1).split(','):
+                    fn = _re.match(r'\s*(\w+)\s*[\(\[]', item)
+                    if fn and fn.group(1) not in fields:
+                        fields.append(fn.group(1))
+
+        # 2. Bullet "- fieldName (Type)" format (ODataProbe)
+        if not fields:
+            for match in _re.finditer(r'^\s*-\s+(\w+)\s*\(', section, _re.MULTILINE):
+                name = match.group(1)
+                if name not in fields:
+                    fields.append(name)
+
+        # 3. FK fields from query-guidance lines (highest priority for filter building)
+        #    SchemaExtractor emits: "$filter=to_FertilizerBlend_orderID%20eq%20<numericValue>"
+        #    These exact field names are what _build_fk_filter / _build_context_filter need.
+        for m in _re.finditer(r'\$filter=(\w+)%20eq%20', section, _re.IGNORECASE):
+            fn = m.group(1)
+            if fn not in fields:
+                fields.append(fn)
+
+        return fields
 
     def _build_filter(self, message: str, fields: list) -> Optional[str]:
         """Build an OData $filter clause from natural language using known field names.
@@ -282,7 +528,177 @@ class SAPAICoreAgent:
             lines.append(f"    {k}: {v}")
         return "\n".join(lines)
 
-    # ── Main data fetcher ─────────────────────────────────────────────────────
+
+    async def _llm_plan_fetch(
+        self,
+        message: str,
+        all_entities: list,
+        fiori_context: Optional[Dict[str, Any]],
+        app_id: Optional[str] = None,
+    ) -> list:
+        """
+        Schema-aware planning agent.
+
+        Builds a compact schema digest from the service tool registry
+        (entity names + their actual key/FK/regular fields) and asks the
+        LLM to produce a precise OData fetch plan.  Zero hardcoded
+        terminology — works for any SAP CAP app because the LLM reasons
+        from the real field names registered by that app's cap-plugin.
+        """
+        import json as _json
+        import aiohttp as _aio
+        import re as _re
+
+        if not all_entities:
+            return []
+
+        current_view = ""
+        if fiori_context:
+            current_view = fiori_context.get("current_view", "") or ""
+
+
+        _entity_schema: dict = {}
+        if app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                for svc in _service_tool_registry.get(app_id, []):
+                    for ent, flds in (svc.get("entity_fields") or {}).items():
+                        fk_fields = [f for f in flds if f.lower().startswith("to_")]
+                        key_fields = [
+                            f for f in flds
+                            if not f.lower().startswith("to_")
+                            and _re.search(r'(?i)(^id$|ID$|Key$|Number$|Code$)', f)
+                            and f not in ("IsActiveEntity", "HasActiveEntity", "HasDraftEntity")
+                        ]
+                        sample = [
+                            f for f in flds
+                            if f not in fk_fields and f not in key_fields
+                            and f not in ("createdAt", "createdBy", "modifiedAt", "modifiedBy",
+                                          "IsActiveEntity", "HasActiveEntity", "HasDraftEntity")
+                        ][:4]
+                        _entity_schema[ent] = {"keys": key_fields, "fks": fk_fields, "sample": sample}
+            except Exception:
+                pass
+
+        # Compact schema lines — capped at 60 entities to stay within token budget
+        schema_lines = []
+        for ent_name, _ in all_entities[:60]:
+            s = _entity_schema.get(ent_name, {})
+            parts = []
+            if s.get("keys"):   parts.append(f"keys=[{', '.join(s['keys'][:3])}]")
+            if s.get("fks"):    parts.append(f"fks=[{', '.join(s['fks'][:4])}]")
+            if s.get("sample"): parts.append(f"fields=[{', '.join(s['sample'][:3])}]")
+            suffix = f"  ({'; '.join(parts)})" if parts else ""
+            schema_lines.append(f"  - {ent_name}{suffix}")
+
+        schema_block = "\n".join(schema_lines)
+
+        # ── System prompt — fully schema-driven, no hardcoded app terminology ─
+        planner_system = (
+            "You are a schema-aware OData fetch planner for SAP CAP applications.\n"
+            "You receive the app's entity schema (entity names, key fields, FK fields)\n"
+            "and the user question.  Produce a precise OData fetch plan.\n\n"
+
+            "RULES:\n"
+            "1. ENTITY SELECTION — select the entity for what the user WANTS TO SEE,\n"
+            "   not the entity named as context/parent.\n"
+            "   Pattern: '<child-things> for/of <parent>' → pick the CHILD entity.\n"
+            "   Pattern: 'show me <entity>'               → pick that entity directly.\n"
+            "   When both a parent entity (e.g. SalesOrder) and a child entity\n"
+            "   (e.g. SalesOrderItem) exist in the schema, and the user asks for\n"
+            "   'items', 'lines', 'details', or similar, always pick the CHILD.\n\n"
+            "2. FILTER — derive the correct field from the schema:\n"
+            "   a) Child entity (has FK fields in fks=[...]): use the FK field name\n"
+            "      EXACTLY as it appears in fks=[...] — never invent your own FK name.\n"
+            "      Example: if fks=[to_SalesOrder_salesOrderNumber] → filter must be\n"
+            "      'to_SalesOrder_salesOrderNumber eq <value>'. Do NOT substitute field\n"
+            "      names from the URL hash (e.g. orderID) into the FK pattern.\n"
+            "   b) Top-level entity (user references it directly by key): use its own\n"
+            "      key field from keys=[...]. NEVER write a 'to_<Self>_...' filter.\n\n"
+            "3. VALUE QUOTING (from the key/FK field name in the schema):\n"
+            "   - Field ends with 'ID' or 'Id' or value is a plain integer → no quotes\n"
+            "   - Field ends with 'Number', 'Code', 'Name', 'Key', 'Text' → single quotes\n\n"
+            "4. CONTEXT KEY — extract the key value from current_view URL when user\n"
+            "   says 'this', 'current', 'for this', etc.\n\n"
+            "5. MULTI-ENTITY — return one fetch per requested entity (max 3 total).\n\n"
+            "6. Return {\"fetches\":[]} for greetings / general / how-to questions.\n\n"
+            "7. When uncertain about the filter field, set filter to null.\n\n"
+            "RESPOND WITH ONLY valid JSON (no markdown):\n"
+            "{\"fetches\": [{\"entity\": \"EntityName\", \"filter\": \"OData expr or null\"}]}"
+        )
+
+        planner_user = (
+            f"App entity schema:\n{schema_block}\n\n"
+            f"Current view URL: {current_view or '(none)'}\n\n"
+            f"User question: {message}"
+        )
+
+        try:
+            token = await self.auth_client.get_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "AI-Resource-Group": "default",
+            }
+            payload = {
+                "orchestration_config": {
+                    "module_configurations": {
+                        "llm_module_config": {
+                            "model_name": self.model_id,
+                            "model_params": {
+                                "max_tokens": 300,
+                                "temperature": 0.0,
+                            },
+                        },
+                        "templating_module_config": {
+                            "template": [
+                                {"role": "system", "content": planner_system},
+                                {"role": "user",   "content": "{{?q}}"},
+                            ]
+                        },
+                    }
+                },
+                "input_params": {"q": planner_user},
+            }
+
+            async with _aio.ClientSession() as session:
+                async with session.post(
+                    self.inference_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=_aio.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("[planner] LLM call failed: %s", resp.status)
+                        return []
+                    result = await resp.json()
+
+            # Extract content from orchestration response
+            content = ""
+            mr = result.get("module_results", {}).get("llm", {})
+            if mr.get("choices"):
+                content = mr["choices"][0].get("message", {}).get("content", "")
+            elif "orchestration_result" in result:
+                choices = result["orchestration_result"].get("choices", [])
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "")
+
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            content = content.strip()
+
+            plan = _json.loads(content)
+            fetches = plan.get("fetches", [])
+            logger.info("[planner] plan: %s", fetches)
+            return fetches
+
+        except Exception as e:
+            logger.warning("[planner] failed (%s) — falling back to regex", e)
+            return []
+
 
     async def _fetch_real_data(
         self,
@@ -293,6 +709,8 @@ class SAPAICoreAgent:
         app_id: Optional[str] = None,
         rag_context: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
+        planned_entity: Optional[str] = None,
+        planned_filter: Optional[str] = None,
     ) -> Optional[str]:
         """
         Detect data-retrieval questions and fetch live data from the app's OData service.
@@ -361,7 +779,7 @@ class SAPAICoreAgent:
         DATA_QUESTION = _re.compile(
             r"\b("
             r"how many|count|total"
-            r"|list|show|display|give me|tell me"
+            r"|list|show|display|give|also"
             r"|get|fetch|find|search|look"
             r"|what(?:\s+are|\s+is)?\s+(?:the|all|available)?"
             r"|available|exist|present"
@@ -373,13 +791,24 @@ class SAPAICoreAgent:
             return None
 
         # ── Extract the PRIMARY NOUN — the main subject of the question ───────
-        # "what are the MATERIALS for..." → primary = "materials"
-        # This is used to boost matching entities whose name contains the subject,
-        # preventing secondary context words ("sales order") from winning.
+        # "what are the MATERIALS for..."   → primary = "materials"
+        # "I need all the saleorderitems..." → primary = "saleorderitems"
+        # "give me the blends..."            → primary = "blends"
+        # Used to (a) constrain Pass 1 exact-match and (b) boost scoring in Pass 2.
         _pn_match = _re.search(
-            r'\b(?:what\s+(?:are\s+)?(?:the\s+)?|show\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'
-            r'|list\s+(?:all\s+)?(?:the\s+)?|get\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'
-            r'|fetch\s+(?:all\s+)?(?:the\s+)?|find\s+(?:all\s+)?(?:the\s+)?)\s*(\w+)',
+            r'\b(?:what\s+(?:are\s+)?(?:the\s+)?'
+            r'|show\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'
+            r'|list\s+(?:all\s+)?(?:the\s+)?'
+            r'|get\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'
+            r'|fetch\s+(?:all\s+)?(?:the\s+)?'
+            r'|find\s+(?:all\s+)?(?:the\s+)?'
+            r'|need\s+(?:all\s+)?(?:the\s+)?'           # "I need all the X"
+            r'|give\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?'  # "give the X" / "give me the X"
+            r'|tell\s+me\s+(?:about\s+)?(?:the\s+)?'   # "tell me about the X"
+            r'|looking\s+for\s+(?:all\s+)?(?:the\s+)?'  # "looking for the X"
+            r'|also\s+(?:give\s+)?(?:the\s+)?'          # "also give the X" / "also the X"
+            r'|can\s+you\s+(?:also\s+)?(?:give\s+)?(?:the\s+)?'  # "can you also give the X"
+            r')\s*(\w+)',
             message, _re.IGNORECASE,
         )
         _primary_noun = _pn_match.group(1).lower() if _pn_match else None
@@ -500,12 +929,58 @@ class SAPAICoreAgent:
         best_entity: Optional[str] = None
         best_service_url: str = service_url  # default to current widget service
 
-        # Pass 1: exact containment (highest confidence)
+        if planned_entity:
+            _pe_lower = planned_entity.lower()
+            for ent in all_candidate_entities:
+                if ent.lower() == _pe_lower:
+                    best_entity = ent
+                    best_service_url = _entity_to_service.get(ent, service_url)
+                    break
+            if not best_entity:
+                best_entity = planned_entity
+                best_service_url = _entity_to_service.get(planned_entity, service_url)
+            logger.info("[fetch_real_data] planner-resolved entity=%s filter=%s", best_entity, planned_filter)
+
+        # Pass 1: exact containment — scoped to PRIMARY NOUN when identifiable.
+        # Rationale: "what are the saleorderitems for salesorder 2466?" contains
+        # "salesorder" as a FILTER word, not the main subject.  If we allowed full-message
+        # scanning, SalesOrder would win over SalesOrderItems.  By restricting Pass 1 to
+        # only match when the entity name == the primary noun, we force compound-word queries
+        # into Pass 2 where trigram + stem-count scoring correctly discriminates sub-entities.
         for ent in all_candidate_entities:
-            if ent.lower() in msg_lower:
-                best_entity = ent
-                best_service_url = _entity_to_service.get(ent, service_url)
-                break
+            ent_lower = ent.lower()
+            if _primary_noun:
+                # Accept exact match OR plural variant (e.g. "processorders" → ProcessOrder).
+                _pn_singular = _primary_noun[:-1] if _primary_noun.endswith('s') else _primary_noun
+                if ent_lower == _primary_noun or ent_lower == _pn_singular:
+                    best_entity = ent
+                    best_service_url = _entity_to_service.get(ent, service_url)
+                    break
+            else:
+                # No primary noun detected → original full-message containment.
+                if ent_lower in msg_lower:
+                    best_entity = ent
+                    best_service_url = _entity_to_service.get(ent, service_url)
+                    break
+
+
+        if best_entity:
+            _be_lower = best_entity.lower()
+            for ent in all_candidate_entities:
+                if ent == best_entity:
+                    continue
+                ent_lower = ent.lower()
+                if not ent_lower.endswith(_be_lower) and not ent_lower.endswith(_be_lower[:-1] if _be_lower.endswith('s') else _be_lower + 's'):
+                    continue
+                _extra_parts = _re.findall(r'[A-Z][a-z0-9]+', ent[:len(ent) - len(best_entity)])
+                if _extra_parts and all(p.lower() in msg_lower for p in _extra_parts):
+                    best_entity = ent
+                    best_service_url = _entity_to_service.get(ent, service_url)
+                    logger.info(
+                        "[fetch_real_data] Pass 1b: refined '%s' → compound entity '%s'",
+                        _be_lower, ent,
+                    )
+                    break
 
         # Pass 2: combined word-stem overlap + trigram similarity
         # word_overlap handles normal spelling; trigrams handle typos.
@@ -533,16 +1008,25 @@ class SAPAICoreAgent:
                 ent_tris = _trigrams(ent)
                 tri_sim = len(msg_tris & ent_tris) / max(len(msg_tris | ent_tris), 1)
 
-                # Primary-noun boost: strongly prefer entity whose name directly
-                # contains the main SUBJECT of the question.
-                # Example: "materials for blend 2466" → primary="materials" →
-                # AssignMaterialToBlend gets +20 over SalesOrders even though
-                # "sales order" appears in the message context.
+                # Primary-noun boost: prefer entities whose name contains MORE stems
+                # from the primary noun.  Counts how many entity word-stems appear as
+                # substrings inside the primary noun (handles compound typos).
+                # Example: primary="saleorderitems"
+                #   SalesOrderItems → stems sale✓ order✓ item✓ → boost = 3×10 = 30
+                #   SalesOrder      → stems sale✓ order✓       → boost = 2×10 = 20
+                # → SalesOrderItems correctly wins.
                 primary_boost = 0.0
                 if _primary_noun and len(_primary_noun) >= 4:
-                    pn4 = _primary_noun[:4]
-                    if any(s.startswith(pn4) or pn4.startswith(s[:4]) for s in stems if len(s) >= 4):
-                        primary_boost = 20.0
+                    pn_lower = _primary_noun.lower()
+                    stem_hits = sum(
+                        1 for s in stems
+                        if len(s) >= 4 and (
+                            s in pn_lower                      # stem is substring of noun
+                            or pn_lower.startswith(s[:4])      # noun starts with stem prefix
+                            or s.startswith(pn_lower[:4])      # stem starts with noun prefix
+                        )
+                    )
+                    primary_boost = stem_hits * 10.0
 
                 score = word_overlap * 3.0 + tri_sim * 10.0 + primary_boost
                 scored.append((score, ent))
@@ -576,20 +1060,97 @@ class SAPAICoreAgent:
         )
 
         # ── Build OData query options from NL ─────────────────────────────────
-        # For cross-service entities, schema_hint doesn't cover their fields.
-        # Fall back to RAG context (which contains schema summaries for ALL entities).
+        # Priority: registry field map → schema_hint → RAG context
+        # For cross-service entities the widget's schema_hint won't cover them;
+        # for standalone chat schema_hint is empty — always fall back to RAG.
         if not _cross_service:
             fields = self._parse_entity_fields(best_entity, schema_hint)
             assocs = self._parse_associations(best_entity, schema_hint)
+            # schema_hint may not include this entity (different entity in current view,
+            # or standalone chat with no widget) — fall back to RAG in that case.
+            if not fields and rag_context:
+                fields = self._parse_fields_from_rag(best_entity, rag_context)
         else:
             fields = self._parse_fields_from_rag(best_entity, rag_context or "")
             assocs = []
 
-        odata_filter = self._build_filter(message, fields) if fields else None
-        if not odata_filter:
-            # FK filter: try to match a bare number in the message to a FK field
-            odata_filter = self._build_fk_filter(message, fields) if fields else None
-        odata_expand = self._build_expand(message, assocs) if assocs else None
+        # Last resort: look up fields from the service tool registry (sent by cap-plugin)
+        if not fields and app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                for svc in _service_tool_registry.get(app_id, []):
+                    reg_fields = svc.get("entity_fields", {}).get(best_entity, [])
+                    if reg_fields:
+                        fields = reg_fields
+                        break
+            except Exception:
+                pass
+
+        logger.info(
+            "[fetch_real_data] fields resolved: count=%d cross_service=%s sample=%s",
+            len(fields or []), _cross_service, (fields or [])[:4],
+        )
+
+        # ── Planner-provided filter takes full priority ───────────────────────
+        if planned_filter:
+            odata_filter = planned_filter
+            odata_expand = self._build_expand(message, assocs) if assocs else None
+        else:
+            odata_filter = self._build_filter(message, fields) if fields else None
+            if not odata_filter:
+                # FK filter: try to match a bare number in the message to a FK field
+                odata_filter = self._build_fk_filter(message, fields) if fields else None
+            if not odata_filter and fiori_context:
+                # Context-aware FK filter: "linked to this blend" has no number in the
+                # message — the ID (e.g. orderID=2466) lives in entity_data from the
+                # current Fiori view. Use it to build to_FertilizerBlend_orderID eq 2466.
+                _CONTEXT_REF = _re.compile(
+                    r"\b(this|current|linked\s+to|associated\s+with|for\s+this|"
+                    r"in\s+this|on\s+this|of\s+this|belonging\s+to)\b",
+                    _re.IGNORECASE,
+                )
+                if _CONTEXT_REF.search(message):
+                    _entity_data = fiori_context.get("entity_data") or {}
+                    _current_view = fiori_context.get("current_view", "")
+                    # When entity_data is empty but the hash URL carries key params
+                    # (e.g. #/FertilizerBlend(orderID=2414,IsActiveEntity=true)),
+                    # parse the numeric keys directly from the URL so the filter
+                    # can still be built even when the frontend sent no entity_data.
+                    if not _entity_data and _current_view:
+                        _entity_data = self._parse_keys_from_view_url(_current_view)
+                        if _entity_data:
+                            logger.info(
+                                "[fetch_real_data] entity_data was empty — parsed from view URL: %s",
+                                _entity_data,
+                            )
+                    logger.info(
+                        "[fetch_real_data] context filter check: entity_data_keys=%s "
+                        "current_view=%r fields_count=%d",
+                        list(_entity_data.keys())[:6], _current_view, len(fields or []),
+                    )
+                    _ctx_filter: Optional[str] = None
+                    if _entity_data and fields:
+                        _ctx_filter = self._build_context_filter(
+                            fields, _entity_data, _current_view
+                        )
+                    # Fallback: fields unavailable (cross-service) or _build_context_filter
+                    # returned None — infer FK from CAP to_<Entity>_<key> naming convention.
+                    if not _ctx_filter and _entity_data and _current_view:
+                        _ctx_filter = self._build_context_filter_from_view(
+                            _entity_data, _current_view
+                        )
+                        if _ctx_filter:
+                            logger.info(
+                                "[fetch_real_data] context filter (view-inferred): %s",
+                                _ctx_filter,
+                            )
+                    if _ctx_filter:
+                        odata_filter = _ctx_filter
+                        logger.info(
+                            "[fetch_real_data] context-aware filter from entity_data: %s",
+                            odata_filter,
+                        )
+            odata_expand = self._build_expand(message, assocs) if assocs else None
 
         # ── User-scoped filter: "my ...", "I have ...", "assigned to me" ───────
         # When the user mentions ownership language AND we know who they are,
@@ -609,6 +1170,16 @@ class SAPAICoreAgent:
                 user_filter = f"{owner_field} eq '{user_id}'"
                 odata_filter = f"{odata_filter} and {user_filter}" if odata_filter else user_filter
 
+        # ── Row limits driven by settings (no hardcoding) ────────────────────
+        try:
+            from app.config.settings import get_settings as _gs
+            _cfg = _gs()
+            _DISPLAY_ROWS: int = _cfg.odata_display_rows    # shown in chat (default 10)
+            _FETCH_ROWS: int   = _cfg.odata_fetch_rows      # fetched from OData (default 50)
+            _AGG_ROWS: int     = _cfg.odata_aggregate_rows  # for group-by (default 500)
+        except Exception:
+            _DISPLAY_ROWS, _FETCH_ROWS, _AGG_ROWS = 10, 50, 500
+
         # Aggregation intent: "by status", "per category", "grouped by type"
         AGG_PAT = _re.compile(
             r'\b(?:by|per|group(?:ed)?\s+by|breakdown\s+by)\s+(\w+)',
@@ -617,11 +1188,29 @@ class SAPAICoreAgent:
         agg_match = AGG_PAT.search(message)
         group_field: Optional[str] = agg_match.group(1) if agg_match else None
 
-        # ── Resolve relative URL ──────────────────────────────────────────────
-        # Use the app_base_url stored at registration time (e.g. http://localhost:4004).
-        # Falls back to localhost:4004 only when the SDK pre-dates app_base_url support.
+        # ── Resolve relative service URL ──────────────────────────────────────
+        # Priority order for the CAP server base URL:
+        #   1. app_base_url stored in registry by cap-plugin at startup (always preferred)
+        #   2. cap_app_base_url from settings  (set in .env for cloud deployments)
+        #   3. Empty string → service_url must already be absolute (logged as warning)
         if service_url.startswith("/"):
-            base = _registry_base_url.rstrip("/") if _registry_base_url else "http://localhost:4004"
+            if _registry_base_url:
+                base = _registry_base_url.rstrip("/")
+            else:
+                try:
+                    from app.config.settings import get_settings as _gs2
+                    _cap_base = _gs2().cap_app_base_url.rstrip("/")
+                except Exception:
+                    _cap_base = ""
+                if _cap_base:
+                    base = _cap_base
+                else:
+                    logger.warning(
+                        "[fetch_real_data] relative service_url '%s' but no base URL in registry "
+                        "or settings.cap_app_base_url — set CAP_APP_BASE_URL in .env",
+                        service_url,
+                    )
+                    base = ""
             service_url = f"{base}{service_url}"
 
         logger.info(
@@ -639,13 +1228,46 @@ class SAPAICoreAgent:
                     f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
                 )
 
-            base_url = f"{service_url.rstrip('/')}/{best_entity}"
+            # aiohttp default urlencode uses quote_plus (spaces → '+'), but CAP's
+            # OData parser only accepts %20.  Build query strings manually.
+            def _odata_qs(params: dict) -> str:
+                from urllib.parse import urlencode, quote as _q
+                return urlencode({k: str(v) for k, v in params.items()}, quote_via=_q)
+
+            # ── Resolve the entity SET name (may differ from type name) ───────
+            # ODataProbe captures type names (SalesOrderItem); the OData endpoint
+            # uses set names (SalesOrderItems).  Prefer the registry-registered
+            # name when available — it is always the correct entity set name.
+            def _resolve_set_name(type_name: str) -> str:
+                if type_name in _entity_to_service:      # already a set name
+                    return type_name
+                # Try adding/removing 's'
+                plural = type_name + 's'
+                if plural in _entity_to_service:
+                    logger.info("[fetch_real_data] Resolved '%s' → set name '%s'", type_name, plural)
+                    return plural
+                singular = type_name[:-1] if type_name.endswith('s') else type_name
+                if singular in _entity_to_service:
+                    logger.info("[fetch_real_data] Resolved '%s' → set name '%s'", type_name, singular)
+                    return singular
+                return type_name  # fall back to type name and let OData 404 trigger retry
+
+            entity_set_name = _resolve_set_name(best_entity)
+            base_url = f"{service_url.rstrip('/')}/{entity_set_name}"
             count_val: Optional[int] = None
             rows_data = None
+            # Candidate URL names to try in order on 404: resolved set name → original → plural → singular
+            _url_candidates: list = [entity_set_name]
+            if best_entity != entity_set_name:
+                _url_candidates.append(best_entity)
+            if not entity_set_name.endswith('s'):
+                _url_candidates.append(entity_set_name + 's')
+            elif entity_set_name.endswith('s'):
+                _url_candidates.append(entity_set_name[:-1])
 
             async with _aio.ClientSession() as session:
-                # Aggregation needs a larger sample; otherwise fetch up to 20 rows
-                top = 200 if group_field else 20
+                # Aggregation needs a much larger sample; otherwise use _FETCH_ROWS
+                top = _AGG_ROWS if group_field else _FETCH_ROWS
                 list_params: dict = {"$top": top}
                 if odata_filter:
                     list_params["$filter"] = odata_filter
@@ -659,8 +1281,9 @@ class SAPAICoreAgent:
                     count_params: dict = {}
                     if odata_filter:
                         count_params["$filter"] = odata_filter
+                    _count_url = f"{base_url}/$count?{_odata_qs(count_params)}" if count_params else f"{base_url}/$count"
                     async with session.get(
-                        base_url + "/$count", params=count_params,
+                        _count_url,
                         headers=headers, timeout=_aio.ClientTimeout(total=8),
                     ) as resp:
                         if resp.status == 200:
@@ -668,10 +1291,29 @@ class SAPAICoreAgent:
                                 count_val = int((await resp.text()).strip())
                             except ValueError:
                                 pass
+                        elif resp.status == 404:
+                            # Retry with alternate entity set name spellings (404 = wrong name)
+                            for _alt in _url_candidates[1:]:
+                                _alt_url = f"{service_url.rstrip('/')}/{_alt}"
+                                _alt_count_url = f"{_alt_url}/$count?{_odata_qs(count_params)}" if count_params else f"{_alt_url}/$count"
+                                async with session.get(
+                                    _alt_count_url,
+                                    headers=headers, timeout=_aio.ClientTimeout(total=8),
+                                ) as r2:
+                                    if r2.status == 200:
+                                        base_url = _alt_url
+                                        entity_set_name = _alt
+                                        logger.info("[fetch_real_data] 404 retry succeeded with '%s'", _alt)
+                                        try:
+                                            count_val = int((await r2.text()).strip())
+                                        except ValueError:
+                                            pass
+                                        break
 
                 # Fetch rows (with optional filter + expand)
+                _list_url = f"{base_url}?{_odata_qs(list_params)}"
                 async with session.get(
-                    base_url, params=list_params,
+                    _list_url,
                     headers=headers, timeout=_aio.ClientTimeout(total=8),
                 ) as resp:
                     if resp.status == 200:
@@ -681,6 +1323,22 @@ class SAPAICoreAgent:
                             total = data.get("@odata.count")
                             if total is not None:
                                 count_val = int(total)
+                    elif resp.status == 404 and base_url.endswith(entity_set_name):
+                        # Last-resort retry with alternate entity name (404 = wrong set name)
+                        safe_params: dict = {"$top": top}
+                        if odata_filter:
+                            safe_params["$filter"] = odata_filter
+                        for _alt in _url_candidates[1:]:
+                            _alt_url = f"{service_url.rstrip('/')}/{_alt}"
+                            async with session.get(
+                                f"{_alt_url}?{_odata_qs(safe_params)}",
+                                headers=headers, timeout=_aio.ClientTimeout(total=8),
+                            ) as r2:
+                                if r2.status == 200:
+                                    data = await r2.json()
+                                    rows_data = data.get("value", [])
+                                    logger.info("[fetch_real_data] rows 404 retry succeeded with '%s'", _alt)
+                                    break
 
             if count_val is None and rows_data is None:
                 return None
@@ -701,48 +1359,85 @@ class SAPAICoreAgent:
                 lines.append(f"Fetched {len(rows_data)} record(s) for grouping.")
                 lines.append(self._aggregate_python(rows_data, group_field))
             else:
+                total = count_val or len(rows_data or [])
                 if count_val is not None:
                     lines.append(f"Total record count: {count_val}")
-                if rows_data:
-                    sample = rows_data[:5]
-                    lines.append(f"Sample records ({len(sample)} of {count_val or len(rows_data)}):")
 
-                    # Collect scalar fields, skip UUIDs unless they're the only key
+                if rows_data:
+                    # ── Column ordering: name/ID fields first ─────────────────
                     uuid_re = _re.compile(
                         r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
                         _re.IGNORECASE
                     )
-                    all_keys: list = []
-                    for row in sample:
+                    # Collect all scalar, non-UUID columns across sample rows
+                    _all_keys: list = []
+                    for row in rows_data[:_DISPLAY_ROWS]:
                         for k in row:
-                            if k not in all_keys:
-                                all_keys.append(k)
+                            if k not in _all_keys:
+                                _all_keys.append(k)
 
-                    # Prefer non-UUID columns; fall back to all if everything is UUID
                     scalar_keys = [
-                        k for k in all_keys
-                        if not isinstance(sample[0].get(k), (dict, list))
-                        and sample[0].get(k) is not None
+                        k for k in _all_keys
+                        if not isinstance(rows_data[0].get(k), (dict, list))
                     ]
                     meaningful_keys = [
                         k for k in scalar_keys
                         if not (
-                            isinstance(sample[0].get(k), str)
-                            and uuid_re.match(str(sample[0].get(k, "")))
+                            isinstance(rows_data[0].get(k), str)
+                            and uuid_re.match(str(rows_data[0].get(k, "")))
                             and k.lower() not in ("id", "key")
                         )
                     ] or scalar_keys
 
-                    # Emit as a simple CSV-style table the LLM can use to build Markdown
+                    # Sort: name/title/number/id columns first for readability
+                    def _col_priority(col: str) -> int:
+                        cl = col.lower()
+                        if cl in ("id", "key"):                         return 0
+                        if cl.endswith("id") or cl.endswith("_id"):     return 1
+                        if "number" in cl:                              return 2
+                        if "name" in cl or "title" in cl:               return 3
+                        if "description" in cl or "desc" in cl:         return 4
+                        if "status" in cl or "state" in cl:             return 5
+                        if "type" in cl or "category" in cl:            return 6
+                        if "date" in cl or "at" in cl:                  return 8
+                        if "by" in cl:                                  return 9
+                        return 7
+
+                    meaningful_keys.sort(key=_col_priority)
+
+                    # ── Display limit + export offer ──────────────────────────
+                    # When a server-side $filter was applied, show ALL fetched rows
+                    # (they are already scoped to exactly what the user asked for).
+                    # Only cap unfiltered results to avoid overwhelming the LLM with
+                    # an entire unrelated entity dump.
+                    display = rows_data if odata_filter else rows_data[:_DISPLAY_ROWS]
+                    has_more = count_val is not None and count_val > len(display)
+
+                    lines.append(
+                        f"Showing {len(display)} of {total} record(s):"
+                        if has_more else
+                        f"Records ({len(display)}):"
+                    )
+
                     if meaningful_keys:
                         lines.append("| " + " | ".join(meaningful_keys) + " |")
                         lines.append("|" + "|".join("---" for _ in meaningful_keys) + "|")
-                        for row in sample:
+                        for row in display:
                             cells = [str(row.get(k, "")) for k in meaningful_keys]
                             lines.append("| " + " | ".join(cells) + " |")
                     else:
-                        for i, row in enumerate(sample, 1):
+                        for i, row in enumerate(display, 1):
                             lines.append(f"  {i}. {_json.dumps(row, default=str)}")
+
+                    # ── Hint when there are more records ──────────────────
+                    if has_more:
+                        lines.append("")
+                        lines.append(
+                            f"*(Showing {len(display)} of {total} records total. "
+                            f"Let me know if you'd like a full report — "
+                            f"I can generate an Excel, PDF, Word, or CSV document with all the data.)*"
+                        )
+
             lines.append("[End of live data]\n")
             return "\n".join(lines)
 
@@ -858,31 +1553,45 @@ class SAPAICoreAgent:
             "use it. Only say an entity doesn't exist if the schema is present AND you have "
             "checked every entity in it and found no reasonable match.\n\n"
 
-            "3b. NEVER FABRICATE DATA\n"
-            "   If no '[Real data from OData]' block is present in the message, do NOT invent "
-            "example rows, fake record IDs, fake field values, or placeholder tables. "
-            "This is the MOST IMPORTANT rule — making up data destroys user trust. "
-            "If the live data block is absent, say: "
-            "'I wasn't able to retrieve the live data for this. Please try again in a moment.' "
-            "Do NOT give the user raw OData query URLs — users are business users, not developers.\n\n"
+            "3b. DATA UNAVAILABILITY\n"
+            "   If no '[Real data from OData]' block is present in the message:\n"
+            "   a) Do NOT invent example rows, fake field values, or placeholder tables.\n"
+            "   b) Do NOT give raw OData URLs to business users.\n"
+            "   c) Do NOT just say 'try again' or 'I wasn't able to retrieve' without more help.\n"
+            "   d) Explain WHAT entity holds the data the user is asking for (name it from the schema),\n"
+            "      and ask one targeted clarifying question if needed (e.g. which order ID?).\n"
+            "      Example: 'The item-level details live in the SalesOrderItem entity. "
+            "I couldn't retrieve those records \u2014 could you confirm order number 2466 is correct?'\n\n"
 
             "4. COUNTS & LIVE DATA\n"
-            "   The user's message may be prefixed with a '[Real data from OData — EntityName]' "
+            "   The user's message may be prefixed with a '[Real data from OData \u2014 EntityName]' "
             "block. When that block is present:\n"
-            "   a) Use the exact numbers from it — do NOT say you cannot query the database.\n"
-            "   b) State the total count naturally (e.g. 'There are 4 fertilizer blends…').\n"
-            "   c) Present the sample records as a **Markdown table** with the most meaningful\n"
-            "      scalar fields as columns (skip internal IDs/UUIDs unless they are the only\n"
-            "      identifier). Example column choice: Status, Name, Date, Amount, etc.\n"
-            "   d) After the table, add 1-2 sentences of brief insight if helpful\n"
-            "      (e.g. breakdown by status, date range, notable values).\n"
-            "   e) If the live data block is absent, say the data is temporarily unavailable "
-            "and ask the user to try again.\n\n"
+            "   a) Use the exact numbers from it \u2014 do NOT say you cannot query the database.\n"
+            "   b) State the total count naturally (e.g. 'There are 4 fertilizer blends\u2026').\n"
+            "   c) Present ALL sample records as a **Markdown table** \u2014 never show just 1 row when\n"
+            "      multiple rows are in the block. Use the most meaningful scalar fields as columns.\n"
+            "   d) After the table, add 1-2 sentences of insight (status breakdown, date range, etc.).\n"
+            "   e) If the live data block is absent, follow rule 3b.\n\n"
 
             "5. STAY IN APP CONTEXT\n"
             "   Every answer must be grounded in the schema provided. "
             "Do not import entity names or field names from previous conversations or "
-            "general SAP knowledge — the current app may have completely different entities."
+            "general SAP knowledge \u2014 the current app may have completely different entities.\n\n"
+
+            "7. PARENT \u2192 CHILD NAVIGATION\n"
+            "   When a user asks for child/related records (items, materials, components, lines):\n"
+            "   a) Identify the CHILD entity from the schema \u2014 it will have a FK field referencing the parent.\n"
+            "   b) A live-data block for the child entity filtered by parent ID will be provided.\n"
+            "      Present it as a COMPLETE table \u2014 do not summarise to just the first row.\n"
+            "   c) If you receive parent-entity data but the user asked for child data, say:\n"
+            "      'The [child entity] data for this [parent] is separate \u2014 try asking: "
+            "      \"show me the [child] for [parent name/ID] [value]\"'\n\n"
+
+            "8. COMPLETENESS\n"
+            "   When the user says 'all', 'full', 'complete', or 'not just parent':\n"
+            "   a) Show the full table from the live-data block (up to 20 rows).\n"
+            "   b) If total > 20, state 'showing {n} of {total}' below the table.\n"
+            "   c) Never silently truncate or show fewer rows than are in the live-data block."
             + entity_section
             + (
                 f"\n\n6. CURRENT USER\n"
@@ -895,15 +1604,20 @@ class SAPAICoreAgent:
             + "\n\n"
 
             "RESPONSE FORMAT RULES (always apply):\n"
-            "  • Lead with the direct answer — never start with 'Sure!' / 'Great!' / 'Of course!'.\n"
-            "  • Use **Markdown tables** for any set of records (>1 row).\n"
-            "  • Use numbered lists for ordered steps; bullet points for unordered options.\n"
-            "  • Use **bold** for entity/field names and key values.\n"
-            "  • Keep responses concise. Expand only if the user asked for detail.\n"
-            "  • When you show a count, follow with a one-line summary (e.g. breakdown by status).\n"
-            "  • Never repeat the user's question back to them.\n"
-            "  • Do not add disclaimers like 'I don't have access to real-time data' when a "
-            "[Real data from OData] block is present — you clearly DO have real data."
+            "  \u2022 Lead with the direct answer \u2014 never start with 'Sure!' / 'Great!' / 'Of course!'.\n"
+            "  \u2022 Use **Markdown tables** for any set of records (>1 row).\n"
+            "  \u2022 Use numbered lists for ordered steps; bullet points for unordered options.\n"
+            "  \u2022 Use **bold** for entity/field names and key values.\n"
+            "  \u2022 Keep responses concise. Expand only if the user asked for detail.\n"
+            "  \u2022 When you show a count, follow with a one-line summary (e.g. breakdown by status).\n"
+            "  \u2022 Never repeat the user's question back to them.\n"
+            "  \u2022 Do not add disclaimers like 'I don't have access to real-time data' when a "
+            "[Real data from OData] block is present \u2014 you clearly DO have real data.\n\n"
+            "DOCUMENT GENERATION RULE:\n"
+            "  When the user asks to generate a report, document, Excel, PDF, Word, or CSV:\n"
+            "  \u2022 Confirm what data you will include and generate it immediately.\n"
+            "  \u2022 Do NOT explain the file format or give instructions on how to open it.\n"
+            "  \u2022 Do NOT say the file is 'ready to download' \u2014 just confirm it is being generated."
         )
 
         if rag_context:
@@ -925,6 +1639,7 @@ class SAPAICoreAgent:
         odata_token: Optional[str] = None,
         user_id: Optional[str] = None,
         raw_message: Optional[str] = None,
+        backend_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.request_count += 1
         start_time = datetime.utcnow()
@@ -932,18 +1647,169 @@ class SAPAICoreAgent:
         rag_context = await self._fetch_rag_context(message, app_id)
         system_message = self._build_system_message(rag_context, app_id, fiori_context, user_id)
 
-        # Fetch real live data from the app's OData service when the user
-        # is asking a data question (counts, lists, records).
-        # Use raw_message (stripped of the fiori context prefix) for entity
-        # matching so that e.g. "View: FertilizerBlend" in the prefix does
-        # not fool Pass 1 into picking FertilizerBlend for every query.
         _match_msg = raw_message if raw_message else message
-        live_data_block = await self._fetch_real_data(
-            fiori_context, odata_token, _match_msg,
-            user_id, app_id,
-            rag_context=rag_context,
-            history=history,
-        )
+
+        # Build entity list for the planner from the service tool registry
+        _plan_entities: list = []
+        if app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                for _svc in _service_tool_registry.get(app_id, []):
+                    for _ent in _svc.get("entities", []):
+                        _plan_entities.append((_ent, _svc.get("service_url", "")))
+            except Exception:
+                pass
+
+        live_data_block: Optional[str] = None
+
+        if _plan_entities:
+            _fetch_plan = await self._llm_plan_fetch(_match_msg, _plan_entities, fiori_context, app_id=app_id)
+        else:
+            _fetch_plan = []
+
+        if _fetch_plan:
+
+            import re as _plan_re
+
+            _reg_flds_lower: dict = {}
+            _reg_flds_orig:  dict = {}
+            if app_id:
+                try:
+                    from app.api.apps import _service_tool_registry
+                    for _sv in _service_tool_registry.get(app_id, []):
+                        for _en, _flist in (_sv.get("entity_fields") or {}).items():
+                            _reg_flds_orig.setdefault(_en, []).extend(_flist)
+                            lset = _reg_flds_lower.setdefault(_en, set())
+                            for _f in _flist:
+                                lset.add(_f.lower())
+                except Exception:
+                    pass
+
+            def _apply_quoting(fk_field: str, val_clean: str) -> str:
+                """Return 'fk eq value' with single-quotes iff the field name ends
+                in a string-typed suffix per CAP convention."""
+                _needs_q = _plan_re.search(
+                    r'(?i)(Number|Name|Code|Key|Text|Description|Ref|Reference)$',
+                    fk_field,
+                )
+                return (
+                    f"{fk_field} eq '{val_clean}'"
+                    if _needs_q
+                    else f"{fk_field} eq {val_clean}"
+                )
+
+            for _item in _fetch_plan:
+                _pf_raw = (_item.get("filter") or "").strip()
+                if not _pf_raw:
+                    continue
+                _pe_raw = (_item.get("entity") or "").strip()
+                _ent_flds_lower = _reg_flds_lower.get(_pe_raw, set())
+                _ent_flds_orig  = _reg_flds_orig.get(_pe_raw, [])
+
+                _ff_m = _plan_re.match(
+                    r'(\w+)\s+(?:eq|ne|lt|gt|le|ge)\s+(.+)',
+                    _pf_raw, _plan_re.IGNORECASE,
+                )
+                if not _ff_m:
+                    continue
+                _ff_name  = _ff_m.group(1)
+                _ff_val   = _ff_m.group(2).strip()
+                _ff_clean = _ff_val.strip("'\"")
+
+                if _pe_raw and _plan_re.match(
+                    rf'(?i)to_{_plan_re.escape(_pe_raw)}_', _ff_name
+                ):
+                    logger.warning(
+                        "[planner] self-referencing FK stripped: entity=%s filter=%r",
+                        _pe_raw, _pf_raw,
+                    )
+                    _item["filter"] = None
+                    continue
+
+                if _ent_flds_lower and _ff_name.lower() in _ent_flds_lower:
+                    continue
+
+                if not _ent_flds_lower:
+
+                    logger.warning(
+                        "[planner] no schema for entity '%s' — stripping filter %r",
+                        _pe_raw, _pf_raw,
+                    )
+                    _item["filter"] = None
+                    continue
+
+                _repaired = False
+
+                _fk_parent_m = _plan_re.match(
+                    r'to_(\w+)_\w+', _ff_name, _plan_re.IGNORECASE
+                )
+                if _fk_parent_m:
+                    _bad_parent = _fk_parent_m.group(1).lower()
+                    _candidates = [
+                        f for f in _ent_flds_orig
+                        if f.lower().startswith("to_") and _bad_parent in f.lower()
+                    ]
+                    if _candidates:
+                        _new_filter = _apply_quoting(_candidates[0], _ff_clean)
+                        logger.info(
+                            "[planner] repaired FK suffix: %r → %r (entity=%s)",
+                            _pf_raw, _new_filter, _pe_raw,
+                        )
+                        _item["filter"] = _new_filter
+                        _repaired = True
+
+                if not _repaired:
+                    _bare = _ff_name.lower()
+                    _candidates = [
+                        f for f in _ent_flds_orig
+                        if f.lower().startswith("to_") and f.lower().endswith(f"_{_bare}")
+                    ]
+                    if _candidates:
+                        _new_filter = _apply_quoting(_candidates[0], _ff_clean)
+                        logger.info(
+                            "[planner] repaired bare key → FK: %r → %r (entity=%s)",
+                            _pf_raw, _new_filter, _pe_raw,
+                        )
+                        _item["filter"] = _new_filter
+                        _repaired = True
+
+                if not _repaired:
+                    logger.warning(
+                        "[planner] field '%s' not in schema for '%s' — "
+                        "stripping filter %r", _ff_name, _pe_raw, _pf_raw,
+                    )
+                    _item["filter"] = None
+
+            # Execute each planned fetch and collect non-empty blocks
+            _blocks = []
+            for _item in _fetch_plan:
+                _pe = _item.get("entity")
+                _pf = _item.get("filter") or None
+                if not _pe:
+                    continue
+                _block = await self._fetch_real_data(
+                    fiori_context, odata_token, _match_msg,
+                    user_id, app_id,
+                    rag_context=rag_context,
+                    history=history,
+                    planned_entity=_pe,
+                    planned_filter=_pf,
+                )
+                if _block:
+                    _blocks.append(_block)
+            if _blocks:
+                live_data_block = "\n\n".join(_blocks)
+
+
+        _planner_ran = bool(_fetch_plan)
+        if not live_data_block and not _planner_ran:
+            live_data_block = await self._fetch_real_data(
+                fiori_context, odata_token, _match_msg,
+                user_id, app_id,
+                rag_context=rag_context,
+                history=history,
+            )
+
         if live_data_block:
             message = live_data_block + message
 
@@ -1036,6 +1902,7 @@ class SAPAICoreAgent:
         odata_token: Optional[str] = None,
         user_id: Optional[str] = None,
         raw_message: Optional[str] = None,
+        backend_url: Optional[str] = None,
     ):
         """Stream response token-by-token using word-level chunking."""
         result = await self.get_response(
@@ -1046,6 +1913,7 @@ class SAPAICoreAgent:
             odata_token=odata_token,
             user_id=user_id,
             raw_message=raw_message,
+            backend_url=backend_url,
         )
         text = result.get("response", "")
         words = text.split(" ")

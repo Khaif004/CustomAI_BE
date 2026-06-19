@@ -1,7 +1,14 @@
+"""
+PgVector-based vector store backed by Neon.tech PostgreSQL.
+
+Replaces ChromaDB with a persistent, enterprise-grade vector store.
+Documents go into `knowledge_documents`; embeddings into `embeddings`.
+Both tables live in the existing Neon schema.
+"""
 import logging
-import os
+import hashlib
+import json
 from typing import List, Dict, Any, Optional
-from langchain_community.vectorstores import Chroma, FAISS
 from langchain_core.documents import Document
 from app.config import get_settings
 
@@ -21,7 +28,6 @@ class SAPAICoreEmbeddings:
                  client_secret: str, deployment_id: str, model: str):
         import httpx
         self._httpx = httpx
-        # SAP AI Core foundation-models: correct inference path is /v1/embeddings (not /embeddings).
         base = aicore_url.rstrip('/')
         self.embeddings_url = f"{base}/v2/inference/deployments/{deployment_id}/v1/embeddings"
         self.token_url = (
@@ -62,7 +68,6 @@ class SAPAICoreEmbeddings:
         }
         for i in range(0, len(texts), batch_size):
             batch = [t[:4000] if len(t) > 4000 else t for t in texts[i:i + batch_size]]
-            # /v1/embeddings accepts an array of strings (OpenAI-compatible)
             resp = self._httpx.post(
                 self.embeddings_url,
                 headers=headers,
@@ -70,12 +75,9 @@ class SAPAICoreEmbeddings:
                 timeout=120,
             )
             if not resp.is_success:
-                logger.error(
-                    f"SAP AI Core embeddings {resp.status_code}: {resp.text[:500]}"
-                )
+                logger.error(f"SAP AI Core embeddings {resp.status_code}: {resp.text[:500]}")
                 resp.raise_for_status()
             data = resp.json()
-            # Sort by index to preserve order
             items = sorted(data["data"], key=lambda x: x.get("index", 0))
             results.extend(item["embedding"] for item in items)
             logger.debug(f"Embedded batch {i // batch_size + 1}: {len(batch)} texts")
@@ -112,27 +114,63 @@ def _build_embeddings():
 
 
 class VectorStoreManager:
+    """
+    pgvector-backed vector store using Neon.tech PostgreSQL.
+
+    Public interface is identical to the old ChromaDB-based manager so
+    KnowledgeBaseManager and search callers need no changes.
+    """
 
     def __init__(self):
         self.embeddings = _build_embeddings()
         self.collection_name = settings.vector_store_collection
-        self.vector_store = self._initialize_store()
 
-    def _initialize_store(self):
-        os.makedirs(settings.vector_store_path, exist_ok=True)
+        if not settings.neon_db_url:
+            raise RuntimeError(
+                "NEON_DB_URL environment variable is required. "
+                "Set it to your Neon PostgreSQL connection string in .env."
+            )
+        self._db_url = settings.neon_db_url
+        self._verify_connection()
 
-        if settings.vector_store_type == "chroma":
-            store = Chroma(collection_name=self.collection_name, embedding_function=self.embeddings,
-                           persist_directory=settings.vector_store_path)
-        elif settings.vector_store_type == "faiss":
-            store = None  # Initialized lazily on first document add
-        else:
-            raise ValueError(f"Unsupported vector store type: {settings.vector_store_type}")
+    # ── Internal helpers ────────────────────────────────────────────────────────
 
-        logger.info(f"Vector store initialized: {settings.vector_store_type}")
-        return store
+    def _connect(self):
+        import psycopg2
+        from pgvector.psycopg2 import register_vector
+        conn = psycopg2.connect(self._db_url)
+        register_vector(conn)
+        return conn
 
-    def add_documents(self, documents: List[Document], metadata: Optional[Dict[str, Any]] = None) -> List[str]:
+    def _verify_connection(self):
+        try:
+            conn = self._connect()
+            conn.close()
+            logger.info("VectorStoreManager — Neon pgvector connection verified.")
+        except Exception as e:
+            logger.error(f"VectorStoreManager — cannot connect to Neon: {e}")
+
+    def _get_or_create_app_uuid(self, cur, app_id: str, app_name: str = "") -> str:
+        """Upsert the application row and return its UUID."""
+        cur.execute(
+            """
+            INSERT INTO applications (application_key, name)
+            VALUES (%s, %s)
+            ON CONFLICT (application_key)
+            DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()
+            RETURNING id
+            """,
+            (app_id, app_name or app_id),
+        )
+        return str(cur.fetchone()[0])
+
+    # ── Public API ──────────────────────────────────────────────────────────────
+
+    def add_documents(
+        self,
+        documents: List[Document],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         if not documents:
             return []
 
@@ -140,57 +178,198 @@ class VectorStoreManager:
             for doc in documents:
                 doc.metadata = {**(doc.metadata or {}), **metadata}
 
-        if settings.vector_store_type == "faiss" and self.vector_store is None:
-            self.vector_store = FAISS.from_documents(documents, self.embeddings)
-            return [f"doc_{i}" for i in range(len(documents))]
+        # Extract app identity from the first document
+        # Documents without an explicit app_id are stored under "__global__"
+        # (general knowledge that applies to all apps)
+        first_meta = documents[0].metadata or {}
+        app_id: str = first_meta.get("app_id", "") or "__global__"
+        app_name: str = first_meta.get("app_name", "") or "Global Knowledge Base"
 
-        ids = self.vector_store.add_documents(documents)
-        return ids or [f"doc_{i}" for i in range(len(documents))]
-
-    def search(self, query: str, k: int = 5, score_threshold: float = 0.0,
-               metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        if settings.vector_store_type == "faiss" and self.vector_store is None:
+        texts = [doc.page_content for doc in documents]
+        try:
+            vectors = self.embeddings.embed_documents(texts)
+        except Exception as e:
+            logger.error(f"Embedding failed for app '{app_id}': {e}")
             return []
 
+        ids: List[str] = []
+        conn = self._connect()
         try:
-            if metadata_filter and settings.vector_store_type == "chroma":
-                results = self.vector_store.similarity_search_with_score(
-                    query, k=k, filter=metadata_filter
-                )
-            else:
-                results = self.vector_store.similarity_search_with_score(query, k=k)
+            with conn:
+                with conn.cursor() as cur:
+                    app_uuid = self._get_or_create_app_uuid(cur, app_id, app_name) if app_id else None
+
+                    for doc, vector in zip(documents, vectors):
+                        meta = doc.metadata or {}
+                        doc_type = meta.get("category", "schema")
+                        title = meta.get("title", "")
+                        content_hash = hashlib.sha256(doc.page_content.encode()).hexdigest()[:64]
+
+                        cur.execute(
+                            """
+                            INSERT INTO knowledge_documents
+                                (application_id, document_type, title, content, metadata, content_hash)
+                            VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                            RETURNING id
+                            """,
+                            (app_uuid, doc_type, title, doc.page_content,
+                             json.dumps(meta), content_hash),
+                        )
+                        doc_uuid = str(cur.fetchone()[0])
+
+                        cur.execute(
+                            """
+                            INSERT INTO embeddings
+                                (application_id, document_id, document_type, content, embedding, model_version)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (app_uuid, doc_uuid, doc_type, doc.page_content,
+                             vector, settings.embedding_model),
+                        )
+                        ids.append(str(cur.fetchone()[0]))
+
+        finally:
+            conn.close()
+
+        logger.info(f"Stored {len(ids)} embeddings for app '{app_id}'")
+        return ids
+
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        score_threshold: float = 0.0,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            query_vector = self.embeddings.embed_query(query)
         except Exception as e:
-            logger.warning(f"Vector search failed (filter={metadata_filter}): {e}")
-            results = self.vector_store.similarity_search_with_score(query, k=k)
+            logger.error(f"Query embedding failed: {e}")
+            return []
 
-        return [
-            {"content": doc.page_content, "score": 1 / (1 + score) if score > 1 else score,
-             "metadata": doc.metadata or {}}
-            for doc, score in results
-            if (1 / (1 + score) if score > 1 else score) >= score_threshold
-        ]
+        # pgvector's psycopg2 adapter registers a type encoder for numpy.ndarray
+        # (not for plain Python lists).  Plain lists are serialized as numeric[]
+        # which lacks the <=> operator.  Convert to numpy so the encoder fires.
+        try:
+            import numpy as np
+            query_vector = np.array(query_vector, dtype=np.float32)
+        except ImportError:
+            pass  # numpy unavailable — fall back to ::vector cast in SQL below
 
-    def delete(self, ids: List[str]) -> bool:
-        if settings.vector_store_type == "chroma":
-            self.vector_store.delete(ids)
+        app_id: Optional[str] = None
+        category: Optional[str] = None
+        if metadata_filter:
+            app_id = metadata_filter.get("app_id")
+            category = metadata_filter.get("category")
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                if app_id:
+                    cur.execute(
+                        """
+                        SELECT e.content,
+                               1 - (e.embedding <=> %s::vector) AS score,
+                               kd.title, kd.document_type, kd.metadata
+                        FROM embeddings e
+                        JOIN knowledge_documents kd ON e.document_id = kd.id
+                        JOIN applications a ON e.application_id = a.id
+                        WHERE a.application_key = %s
+                        ORDER BY e.embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        (query_vector, app_id, query_vector, k),
+                    )
+                elif category:
+                    cur.execute(
+                        """
+                        SELECT e.content,
+                               1 - (e.embedding <=> %s::vector) AS score,
+                               kd.title, kd.document_type, kd.metadata
+                        FROM embeddings e
+                        JOIN knowledge_documents kd ON e.document_id = kd.id
+                        WHERE kd.document_type = %s
+                        ORDER BY e.embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        (query_vector, category, query_vector, k),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT e.content,
+                               1 - (e.embedding <=> %s::vector) AS score,
+                               kd.title, kd.document_type, kd.metadata
+                        FROM embeddings e
+                        JOIN knowledge_documents kd ON e.document_id = kd.id
+                        ORDER BY e.embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        (query_vector, query_vector, k),
+                    )
+
+                rows = cur.fetchall()
+
+        finally:
+            conn.close()
+
+        results: List[Dict[str, Any]] = []
+        for content, score, title, doc_type, meta_json in rows:
+            score_f = float(score)
+            if score_f < score_threshold:
+                continue
+            meta = meta_json if isinstance(meta_json, dict) else {}
+            if title:
+                meta["title"] = title
+            if doc_type:
+                meta["category"] = doc_type
+            results.append({"content": content, "score": score_f, "metadata": meta})
+
+        return results
+
+    def delete(self, app_id: str) -> bool:
+        """Delete all documents and embeddings for an app."""
+        conn = self._connect()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM knowledge_documents
+                        WHERE application_id = (
+                            SELECT id FROM applications WHERE application_key = %s
+                        )
+                        """,
+                        (app_id,),
+                    )
+                    count = cur.rowcount
+            logger.info(f"Deleted {count} documents for app '{app_id}'")
             return True
-        return False
+        except Exception as e:
+            logger.error(f"Delete failed for app '{app_id}': {e}")
+            return False
+        finally:
+            conn.close()
 
     def persist(self):
-        if settings.vector_store_type == "chroma":
-            self.vector_store.persist()
-        elif settings.vector_store_type == "faiss" and self.vector_store:
-            self.vector_store.save_local(settings.vector_store_path)
+        pass  # Neon auto-persists every write — nothing to do
 
     def get_stats(self) -> Dict[str, Any]:
+        conn = self._connect()
         try:
-            if settings.vector_store_type == "chroma":
-                collection = self.vector_store._collection
-                return {"type": "chroma", "collection_name": self.collection_name,
-                        "total_documents": collection.count() if hasattr(collection, 'count') else 0}
-            elif settings.vector_store_type == "faiss":
-                return {"type": "faiss",
-                        "total_documents": self.vector_store.index.ntotal if self.vector_store else 0}
-            return {}
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM embeddings")
+                total = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(DISTINCT application_id) FROM embeddings")
+                apps = cur.fetchone()[0]
+            return {
+                "type": "pgvector",
+                "collection_name": self.collection_name,
+                "total_documents": int(total),
+                "total_apps": int(apps),
+            }
         except Exception as e:
-            return {"error": str(e)}
+            return {"type": "pgvector", "error": str(e)}
+        finally:
+            conn.close()

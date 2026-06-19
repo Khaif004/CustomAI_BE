@@ -79,6 +79,9 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.allowed_origins.split(",")]
 
     database_url: Optional[str] = None
+    # Neon.tech PostgreSQL connection string for pgvector (schema/embeddings storage)
+    # Set via NEON_DB_URL in .env — required when vector_store_type = "pgvector"
+    neon_db_url: Optional[str] = None
     db_host: Optional[str] = None
     db_port: int = 5432
     db_user: Optional[str] = None
@@ -101,7 +104,7 @@ class Settings(BaseSettings):
     hana_database: Optional[str] = None
 
     # Vector Store
-    vector_store_type: str = "chroma"  # "chroma", "faiss", "pinecone"
+    vector_store_type: str = "pgvector"  # "pgvector" (Neon), "chroma", "faiss"
     vector_store_path: str = "./data/vector_store"
     vector_store_collection: str = "joule_knowledge"
     embedding_model: str = "text-embedding-3-small"
@@ -114,6 +117,25 @@ class Settings(BaseSettings):
     # Agent
     max_agent_iterations: int = 10
     agent_timeout_seconds: int = 30
+
+    # Live data display & export
+    # Number of rows shown inline in the chat response.
+    # When total_count > this, download links are offered instead.
+    odata_display_rows: int = 10
+    # Maximum rows fetched from OData for inline display (must be >= odata_display_rows)
+    odata_fetch_rows: int = 50
+    # Maximum rows fetched when doing a group-by aggregation
+    odata_aggregate_rows: int = 500
+    # Base URL used when building export download links in responses.
+    # Leave empty (default) to auto-detect from the incoming HTTP request.
+    # Set via BACKEND_BASE_URL env var when behind a reverse proxy or in production.
+    backend_base_url: str = ""
+    # Fallback base URL for CAP app when not registered via cap-plugin.
+    # In production set this to your CAP deployment URL, e.g. https://my-cap-app.cfapps.eu10.hana.ondemand.com
+    # The registry (app_base_url from cap-plugin) always takes precedence over this value.
+    cap_app_base_url: str = ""
+    # OData query cache TTL in minutes (set to 0 to disable caching)
+    query_cache_ttl_minutes: int = 30
 
     # Feature Flags
     enable_conversation_memory: bool = True

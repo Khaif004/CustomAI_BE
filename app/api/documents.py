@@ -373,8 +373,14 @@ def _build_excel(data: dict) -> bytes:
 
         if sheet_data.get("summary"):
             sum_row = data_start_row + len(sheet_data.get("rows", [])) + 2
-            sum_cell = ws.cell(row=sum_row, column=1, value=sheet_data["summary"])
-            sum_cell.font = Font(bold=True, italic=True, size=10, color="374151")
+            summary = sheet_data["summary"]
+            if isinstance(summary, list):
+                for col_idx, val in enumerate(summary, start=1):
+                    sc = ws.cell(row=sum_row, column=col_idx, value=val if not isinstance(val, (dict, list)) else str(val))
+                    sc.font = Font(bold=True, italic=True, size=10, color="374151")
+            else:
+                sum_cell = ws.cell(row=sum_row, column=1, value=str(summary) if summary is not None else "")
+                sum_cell.font = Font(bold=True, italic=True, size=10, color="374151")
 
         for col_idx in range(1, len(headers) + 1):
             max_len = max(

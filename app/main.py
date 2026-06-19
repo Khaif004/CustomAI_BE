@@ -26,6 +26,12 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
+    # Restore service tool registry from Neon DB so it survives backend restarts
+    try:
+        from app.api.apps import load_service_registry_from_db
+        load_service_registry_from_db()
+    except Exception as e:
+        logger.warning(f"Service registry pre-load skipped: {e}")
 
 
 @app.on_event("shutdown")
@@ -70,6 +76,13 @@ try:
     logger.info("Documents API routes registered")
 except Exception as e:
     logger.warning(f"Documents routes not available: {e}")
+
+try:
+    from app.api import export as export_api
+    app.include_router(export_api.router)
+    logger.info("Export API routes registered")
+except Exception as e:
+    logger.warning(f"Export routes not available: {e}")
 
 
 if __name__ == "__main__":
