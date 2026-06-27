@@ -418,14 +418,125 @@ def _persist_service_tool(app_id: str, entry: Dict[str, Any]) -> None:
                 )
                 svc_uuid = str(cur.fetchone()[0])
 
-                # Insert entity rows
-                for ent in entry.get("entities", []):
-                    cur.execute(
-                        "INSERT INTO entities (service_id, entity_name) VALUES (%s, %s)",
-                        (svc_uuid, ent),
-                    )
+                import json as _json
+                import re as _re
+                _ent_fields_map = entry.get("entity_fields") or {}
 
-        logger.debug(f"[registry] Persisted service tool for '{app_id}' / '{service_url}'")
+                for ent in entry.get("entities", []):
+                    _fields = _ent_fields_map.get(ent, [])
+                    _fk_fields = [f for f in _fields if f.lower().startswith("to_")]
+                    _key_fields = [
+                        f for f in _fields
+                        if not f.lower().startswith("to_")
+                        and _re.search(r'(?i)(^id$|ID$|Key$|Number$|Code$)', f)
+                        and f not in ("IsActiveEntity", "HasActiveEntity", "HasDraftEntity")
+                    ]
+
+                    # ── Insert/upsert entity row ───────────────────────────
+                    cur.execute(
+                        """
+                        INSERT INTO entities (service_id, entity_name, entity_fields, fk_filters)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (service_id, entity_name) DO UPDATE
+                            SET entity_fields = EXCLUDED.entity_fields,
+                                fk_filters    = EXCLUDED.fk_filters,
+                                updated_at    = NOW()
+                        RETURNING id
+                        """,
+                        (svc_uuid, ent,
+                         _json.dumps(_fields),
+                         _json.dumps(_fk_fields)),
+                    )
+                    ent_uuid = str(cur.fetchone()[0])
+
+                    # ── Populate normalized entity_fields table ────────────
+                    # Delete old rows first (replace approach)
+                    cur.execute("DELETE FROM entity_fields WHERE entity_id = %s", (ent_uuid,))
+                    for field_name in _fields:
+                        _is_key = field_name in _key_fields
+                        _is_fk  = field_name.lower().startswith("to_")
+                        if _is_fk:
+                            _dtype = "Association"
+                        elif _re.search(r'(?i)(^id$|ID$)', field_name):
+                            _dtype = "Integer"
+                        elif field_name in ("createdAt", "modifiedAt"):
+                            _dtype = "Timestamp"
+                        elif field_name in ("createdBy", "modifiedBy"):
+                            _dtype = "String"
+                        elif _re.search(r'(?i)(Size$|Count$|Qty$|Quantity$|Amount$|Number$)', field_name):
+                            _dtype = "Decimal"
+                        else:
+                            _dtype = "String"
+                        cur.execute(
+                            """
+                            INSERT INTO entity_fields
+                                (entity_id, field_name, data_type, is_key, is_nullable)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (ent_uuid, field_name, _dtype, _is_key,
+                             field_name not in _key_fields),
+                        )
+
+                    for fk_field in _fk_fields:
+                        _fk_m = _re.match(r'to_([A-Za-z][A-Za-z0-9]*)_(\w+)$', fk_field)
+                        if not _fk_m:
+                            continue
+                        parent_ent  = _fk_m.group(1)
+                        parent_key  = _fk_m.group(2)
+                        _is_int_key = bool(_re.search(r'(?i)(^id$|ID$)', parent_key))
+                        cur.execute(
+                            """
+                            INSERT INTO entity_associations
+                                (application_id, source_service_id, source_entity_name,
+                                 target_entity_name, fk_field,
+                                 relationship_type, cardinality, is_integer_key)
+                            VALUES (%s, %s, %s, %s, %s, 'composition', 'many-to-one', %s)
+                            ON CONFLICT (source_service_id, source_entity_name, fk_field)
+                            DO UPDATE SET
+                                target_entity_name = EXCLUDED.target_entity_name,
+                                is_integer_key     = EXCLUDED.is_integer_key
+                            """,
+                            (app_uuid, svc_uuid, ent,
+                             parent_ent, fk_field, _is_int_key),
+                        )
+
+                # ── Populate entity_aliases (bare → compound) ──────────────
+                # e.g. 'Farms' → 'SelectedFarms', 'Fields' → 'SelectedFields'
+                _all_ents = list(_ent_fields_map.keys()) + entry.get("entities", [])
+                _ent_set  = sorted(set(_all_ents))
+                for compound in _ent_set:
+                    _c_lower = compound.lower()
+                    for bare in _ent_set:
+                        if bare == compound:
+                            continue
+                        _b_lower = bare.lower()
+                        # compound ends with bare name (e.g. SelectedFarms ends with farms/farm)
+                        _b_sing = _b_lower[:-1] if _b_lower.endswith('s') else _b_lower
+                        if _c_lower != _b_lower and (
+                            _c_lower.endswith(_b_lower) or _c_lower.endswith(_b_sing)
+                        ):
+                            # Fetch compound entity id
+                            cur.execute(
+                                "SELECT id FROM entities WHERE service_id = %s AND entity_name = %s",
+                                (svc_uuid, compound),
+                            )
+                            _row = cur.fetchone()
+                            if _row:
+                                _cmp_uuid = str(_row[0])
+                                cur.execute(
+                                    """
+                                    INSERT INTO entity_aliases (entity_id, alias)
+                                    VALUES (%s, %s)
+                                    ON CONFLICT DO NOTHING
+                                    """,
+                                    (_cmp_uuid, bare),
+                                )
+
+        logger.debug(
+            f"[registry] Persisted service tool for '{app_id}' / '{service_url}' "
+            f"(entities={len(entry.get('entities',[]))}, "
+            f"associations written, aliases written)"
+        )
     except Exception as e:
         logger.warning(f"[registry] Failed to persist service tool for '{app_id}': {e}")
     finally:
@@ -456,16 +567,60 @@ def load_service_registry_from_db() -> None:
 
             loaded = 0
             for app_key, app_name, svc_id, svc_url, base_url, reg_at in rows:
-                # Load entities for this service
+                # Load entities AND their field lists for this service
                 cur.execute(
-                    "SELECT entity_name FROM entities WHERE service_id = %s", (svc_id,)
+                    "SELECT entity_name, entity_fields FROM entities WHERE service_id = %s",
+                    (svc_id,)
                 )
-                entities = [r[0] for r in cur.fetchall()]
+                ent_rows = cur.fetchall()
+                entities = [r[0] for r in ent_rows]
+                # Reconstruct entity_fields dict: {entity_name: [field, ...]}
+                import json as _json
+                entity_fields: Dict[str, list] = {}
+                for ent_name, ent_flds_raw in ent_rows:
+                    try:
+                        flds = _json.loads(ent_flds_raw) if isinstance(ent_flds_raw, str) else (ent_flds_raw or [])
+                    except Exception:
+                        flds = []
+                    if flds:
+                        entity_fields[ent_name] = flds
+
+                # Load entity_aliases: alias → canonical entity name
+                cur.execute(
+                    """
+                    SELECT ea.alias, e.entity_name
+                    FROM entity_aliases ea
+                    JOIN entities e ON e.id = ea.entity_id
+                    WHERE e.service_id = %s
+                    """,
+                    (svc_id,)
+                )
+                aliases: Dict[str, str] = {row[0]: row[1] for row in cur.fetchall()}
+
+                # Load entity_associations: source_entity → {fk_field, target_entity}
+                cur.execute(
+                    """
+                    SELECT source_entity_name, target_entity_name, fk_field, is_integer_key
+                    FROM entity_associations
+                    WHERE source_service_id = %s
+                    """,
+                    (svc_id,)
+                )
+                associations: list = [
+                    {
+                        "source": r[0], "target": r[1],
+                        "fk_field": r[2], "is_integer_key": r[3],
+                    }
+                    for r in cur.fetchall()
+                ]
 
                 entry = {
                     "app_name": app_name or app_key,
                     "service_url": svc_url or "",
                     "entities": entities,
+                    "entity_fields": entity_fields,
+                    "entity_aliases": aliases,
+                    "entity_associations": associations,
                     "app_base_url": base_url or "",
                     "registered_at": reg_at.isoformat() if reg_at else "",
                 }
@@ -557,6 +712,31 @@ async def register_service_tool(request: ServiceToolRequest):
 async def list_service_tools():
     """Return all currently registered OData service tools."""
     return _service_tool_registry
+
+
+@router.get("/{app_id}/doc-count")
+async def get_doc_count(app_id: str):
+
+    conn = _neon_conn()
+    if not conn:
+        return {"count": 0}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM knowledge_documents kd
+                JOIN applications a ON a.id = kd.application_id
+                WHERE a.application_key = %s
+                """,
+                (app_id,),
+            )
+            row = cur.fetchone()
+            return {"count": int(row[0]) if row else 0}
+    except Exception:
+        return {"count": 0}
+    finally:
+        conn.close()
+
 
 
 def get_service_tool(app_id: str) -> Optional[Dict[str, Any]]:

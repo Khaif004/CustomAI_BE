@@ -147,9 +147,6 @@ class SAPAICoreAgent:
         if not numbers:
             return None
 
-        # Separate CAP-style "to_*" FK fields from other numeric-identifier fields.
-        # Prefer "to_*" exclusively: they are unambiguous parent FKs by convention,
-        # unlike PK fields (e.g. assignMaterialBlendID) which also end with "ID".
         to_fk = [
             f for f in fields
             if _re.match(r'(?i)to_', f)
@@ -188,8 +185,7 @@ class SAPAICoreAgent:
                 best_fk = fk
 
         if best_fk:
-            # String-typed fields in CAP: salesOrderNumber, any field ending in
-            # 'Number', 'Name', 'Code', 'Key', 'Text' need single-quoted values.
+
             _needs_quotes = _re.search(
                 r'(?i)(Number|Name|Code|Key|Text|Description|Ref|Reference)$', best_fk
             )
@@ -208,7 +204,6 @@ class SAPAICoreAgent:
         if not entity_data or not target_fields:
             return None
 
-        # Infer current entity name from URL hash, e.g. "#/FertilizerBlend/2466"
         _view_entity: Optional[str] = None
         for pat in [
             r'[/#]([A-Z][A-Za-z0-9]+)[/#?]',
@@ -219,7 +214,6 @@ class SAPAICoreAgent:
                 _view_entity = m.group(1)
                 break
 
-        # Collect key-like fields from entity_data (integer IDs preferred)
         _key_candidates: list = []
         for k, v in entity_data.items():
             if v is None:
@@ -241,7 +235,7 @@ class SAPAICoreAgent:
             fk_lower = fk_field.lower()
 
             # Pass 1: FK field name contains the current view entity name.
-            # e.g. to_FertilizerBlend_orderID when viewing FertilizerBlend
+
             if _view_entity and _view_entity.lower() in fk_lower and "_" in fk_field:
                 key_part = fk_field.split("_")[-1]
                 for ed_k, ed_v in entity_data.items():
@@ -251,7 +245,6 @@ class SAPAICoreAgent:
                         return f"{fk_field} eq '{ed_v}'"
 
             # Pass 2: FK field name matches an entity_data key exactly.
-            # e.g. entity_data has 'salesOrderNumber' and FK is 'salesOrderNumber'
             for ed_k, ed_v in _key_candidates:
                 if fk_lower == ed_k.lower():
                     if isinstance(ed_v, (int, float)):
@@ -259,11 +252,7 @@ class SAPAICoreAgent:
                     return f"{fk_field} eq '{ed_v}'"
 
         # Pass 3: cross-entity FK — target entity belongs to a DIFFERENT service
-        # than the current view entity (e.g. viewing FertilizerBlend but fetching
-        # SalesOrderItem whose FK is to_SalesOrder_salesOrderNumber).
-        # No name-based match is possible, so use the first registered to_* FK
-        # field together with the most prominent entity_data key value.
-        # Quoting is applied correctly based on the FK field name suffix.
+
         to_fk_fields = [
             f for f in target_fields
             if _re.match(r'(?i)to_', f) and "_" in f[3:]
@@ -285,7 +274,6 @@ class SAPAICoreAgent:
 
     def _parse_keys_from_view_url(self, current_view: str) -> dict:
         """Extract key-value pairs from a Fiori hash URL such as
-        '#/FertilizerBlend(orderID=2414,IsActiveEntity=true)'.
         Returns a dict of numeric/string keys (booleans and 'null' are skipped).
         """
         import re as _re
@@ -316,8 +304,7 @@ class SAPAICoreAgent:
         current_view: str,
     ) -> Optional[str]:
         """Infer an OData FK filter using CAP naming convention when the field list
-        is unavailable (cross-service entity).  Given URL hash #/FertilizerBlend/1856
-        and entity_data {orderID: 1856}, produces:  to_FertilizerBlend_orderID eq 1856
+        is unavailable (cross-service entity).
         """
         import re as _re
         if not entity_data or not current_view:
@@ -358,6 +345,16 @@ class SAPAICoreAgent:
             return None
 
         ed_k, ed_v = key_candidates[0]
+
+        target_entity = getattr(self, '_current_fetch_entity', None)
+        if target_entity and target_entity.lower() == _view_entity.lower():
+            if isinstance(ed_v, (int, float)):
+                return f"{ed_k} eq {_val_str(ed_v)}"
+            iv = _try_int(ed_v)
+            if iv is not None:
+                return f"{ed_k} eq {iv}"
+            return f"{ed_k} eq '{ed_v}'"
+
         fk_field = f"to_{_view_entity}_{ed_k}"
         if isinstance(ed_v, (int, float)):
             return f"{fk_field} eq {_val_str(ed_v)}"
@@ -580,10 +577,34 @@ class SAPAICoreAgent:
             except Exception:
                 pass
 
-        # Compact schema lines — capped at 60 entities to stay within token budget
+
+        _schema_ent_names = [ent_name for ent_name, _ in all_entities[:60]]
+        _ent_names_lower = [e.lower() for e in _schema_ent_names]
+        _deduped_entities = []
+        for ent_name in _schema_ent_names:
+            _bare = ent_name.lower()
+            _bare_s = _bare[:-1] if _bare.endswith('s') else _bare
+            _has_compound = any(
+                e != _bare and (e.endswith(_bare) or e.endswith(_bare_s) or e.endswith(_bare_s + 's'))
+                for e in _ent_names_lower
+            )
+            if _has_compound:
+                continue
+            _deduped_entities.append(ent_name)
+
         schema_lines = []
-        for ent_name, _ in all_entities[:60]:
+        for ent_name in _deduped_entities:
             s = _entity_schema.get(ent_name, {})
+            # If this entity lacks schema, check if a compound variant has it
+            if not s:
+                _bare = ent_name.lower()
+                for _reg_ent, _reg_s in _entity_schema.items():
+                    if _reg_ent.lower() != _bare and (
+                        _reg_ent.lower().endswith(_bare)
+                        or _reg_ent.lower().endswith(_bare[:-1] if _bare.endswith('s') else _bare)
+                    ):
+                        s = _reg_s
+                        break
             parts = []
             if s.get("keys"):   parts.append(f"keys=[{', '.join(s['keys'][:3])}]")
             if s.get("fks"):    parts.append(f"fks=[{', '.join(s['fks'][:4])}]")
@@ -620,7 +641,13 @@ class SAPAICoreAgent:
             "   - Field ends with 'Number', 'Code', 'Name', 'Key', 'Text' → single quotes\n\n"
             "4. CONTEXT KEY — extract the key value from current_view URL when user\n"
             "   says 'this', 'current', 'for this', etc.\n\n"
-            "5. MULTI-ENTITY — return one fetch per requested entity (max 3 total).\n\n"
+            "5. MULTI-ENTITY (CRITICAL) — when the user asks for MULTIPLE things in\n"
+            "   one question (uses 'and', 'also', commas, or lists multiple entity names),\n"
+            "   you MUST return one fetch entry per requested concept — up to 5 total.\n"
+            "   Examples:\n"
+            "     'farms and fields and areas' → 3 entries (SelectedFarms, SelectedFields, SelectedAreas)\n"
+            "     'show me X, Y and Z' → 3 entries\n"
+            "   NEVER collapse multiple requested entities into one single entry.\n\n"
             "6. Return {\"fetches\":[]} for greetings / general / how-to questions.\n\n"
             "7. When uncertain about the filter field, set filter to null.\n\n"
             "RESPOND WITH ONLY valid JSON (no markdown):\n"
@@ -646,7 +673,7 @@ class SAPAICoreAgent:
                         "llm_module_config": {
                             "model_name": self.model_id,
                             "model_params": {
-                                "max_tokens": 300,
+                                "max_tokens": 512,
                                 "temperature": 0.0,
                             },
                         },
@@ -1058,6 +1085,9 @@ class SAPAICoreAgent:
             "[fetch_real_data] resolved entity=%s from %s (cross_service=%s)",
             best_entity, service_url, _cross_service
         )
+
+
+        self._current_fetch_entity = best_entity
 
         # ── Build OData query options from NL ─────────────────────────────────
         # Priority: registry field map → schema_hint → RAG context
@@ -1706,6 +1736,32 @@ class SAPAICoreAgent:
                 _ent_flds_lower = _reg_flds_lower.get(_pe_raw, set())
                 _ent_flds_orig  = _reg_flds_orig.get(_pe_raw, [])
 
+                # ── Pass 1b: resolve compound entity (mirrors _fetch_real_data logic) ──
+                # If LLM returned 'Farms' but registry only has 'SelectedFarms',
+                # resolve it now so filter validation/repair uses the right FK fields.
+                if not _ent_flds_lower:
+                    _pe_lower = _pe_raw.lower()
+                    _pe_singular = _pe_lower[:-1] if _pe_lower.endswith('s') else _pe_lower
+                    for _reg_ent in list(_reg_flds_orig.keys()):
+                        _re_lower = _reg_ent.lower()
+                        if (
+                            _re_lower != _pe_lower
+                            and (
+                                _re_lower.endswith(_pe_lower)
+                                or _re_lower.endswith(_pe_singular)
+                                or _re_lower.endswith(_pe_lower + 's')
+                            )
+                        ):
+                            _ent_flds_lower = _reg_flds_lower.get(_reg_ent, set())
+                            _ent_flds_orig  = _reg_flds_orig.get(_reg_ent, [])
+                            logger.info(
+                                "[planner] Pass 1b resolved '%s' → '%s' for filter validation",
+                                _pe_raw, _reg_ent,
+                            )
+                            _item["entity"] = _reg_ent
+                            _pe_raw = _reg_ent
+                            break
+
                 _ff_m = _plan_re.match(
                     r'(\w+)\s+(?:eq|ne|lt|gt|le|ge)\s+(.+)',
                     _pf_raw, _plan_re.IGNORECASE,
@@ -1730,12 +1786,12 @@ class SAPAICoreAgent:
                     continue
 
                 if not _ent_flds_lower:
-
                     logger.warning(
-                        "[planner] no schema for entity '%s' — stripping filter %r",
+                        "[planner] no schema for entity '%s' — keeping filter %r as-is "
+                        "(schema will be available after cap-copilot-sdk pushes metadata)",
                         _pe_raw, _pf_raw,
                     )
-                    _item["filter"] = None
+                    # Do NOT strip the filter — let OData validate it.
                     continue
 
                 _repaired = False
@@ -1780,23 +1836,21 @@ class SAPAICoreAgent:
                     )
                     _item["filter"] = None
 
-            # Execute each planned fetch and collect non-empty blocks
-            _blocks = []
-            for _item in _fetch_plan:
-                _pe = _item.get("entity")
-                _pf = _item.get("filter") or None
-                if not _pe:
-                    continue
-                _block = await self._fetch_real_data(
+            # Execute each planned fetch in PARALLEL and collect non-empty blocks
+            import asyncio as _asyncio
+            _fetch_tasks = [
+                self._fetch_real_data(
                     fiori_context, odata_token, _match_msg,
                     user_id, app_id,
                     rag_context=rag_context,
                     history=history,
-                    planned_entity=_pe,
-                    planned_filter=_pf,
+                    planned_entity=_item.get("entity"),
+                    planned_filter=_item.get("filter") or None,
                 )
-                if _block:
-                    _blocks.append(_block)
+                for _item in _fetch_plan if _item.get("entity")
+            ]
+            _results = await _asyncio.gather(*_fetch_tasks, return_exceptions=True)
+            _blocks = [r for r in _results if isinstance(r, str) and r]
             if _blocks:
                 live_data_block = "\n\n".join(_blocks)
 
