@@ -25,7 +25,8 @@ class SAPAICoreEmbeddings:
     """
 
     def __init__(self, aicore_url: str, auth_url: str, client_id: str,
-                 client_secret: str, deployment_id: str, model: str):
+                 client_secret: str, deployment_id: str, model: str,
+                 resource_group: str = "default"):
         import httpx
         self._httpx = httpx
         base = aicore_url.rstrip('/')
@@ -37,6 +38,7 @@ class SAPAICoreEmbeddings:
         self.client_id = client_id
         self.client_secret = client_secret
         self.model = model
+        self._resource_group = resource_group or "default"
         self._token = None
         self._token_expiry = 0
         logger.info(f"SAP AI Core Embeddings — deployment: {deployment_id}, model: {model}")
@@ -64,7 +66,7 @@ class SAPAICoreEmbeddings:
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "AI-Resource-Group": "default",
+            "AI-Resource-Group": self._resource_group,
         }
         for i in range(0, len(texts), batch_size):
             batch = [t[:4000] if len(t) > 4000 else t for t in texts[i:i + batch_size]]
@@ -75,6 +77,12 @@ class SAPAICoreEmbeddings:
                 timeout=120,
             )
             if not resp.is_success:
+                if resp.status_code == 404:
+                    raise RuntimeError(
+                        f"Embedding deployment not found (404). "
+                        f"Set SAP_AICORE_EMBEDDING_DEPLOYMENT_ID in .env to a valid deployment. "
+                        f"URL: {self.embeddings_url}"
+                    )
                 logger.error(f"SAP AI Core embeddings {resp.status_code}: {resp.text[:500]}")
                 resp.raise_for_status()
             data = resp.json()
@@ -103,6 +111,7 @@ def _build_embeddings():
             client_secret=settings.sap_aicore_client_secret,
             deployment_id=embedding_deployment,
             model=settings.embedding_model,
+            resource_group=getattr(settings, "sap_aicore_resource_group", "default"),
         )
     else:
         from langchain_openai import OpenAIEmbeddings
