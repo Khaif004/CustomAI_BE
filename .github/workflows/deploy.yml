@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: deploy-be-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: false 
 
 jobs:
   deploy:
