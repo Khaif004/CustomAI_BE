@@ -62,10 +62,39 @@ class SAPAICoreAgent:
         self.deployment_id = deployment_id
         self.request_count = 0
 
+        # Code-list (sap.common.CodeList) resolution caches — see _get_code_catalog /
+        # _load_code_list.  Keep raw developer codes (001/002) out of user-facing answers
+        # by translating labels↔codes generically for ANY CAP app.
+        self._code_catalog_cache: Dict[str, dict] = {}     # app_id -> catalog
+        self._code_list_cache: Dict[tuple, tuple] = {}     # (app_id, entity) -> (forward, reverse)
+
         self.auth_client = SAPAICoreAuth(auth_url=auth_url, client_id=client_id, client_secret=client_secret)
+
+        try:
+            from app.config.settings import get_settings as _gs
+            self._resource_group: str = _gs().sap_aicore_resource_group or "default"
+        except Exception:
+            self._resource_group = "default"
+
+        # Detect whether this is a direct Anthropic/Claude foundation-model deployment
+        # (scenarioId: foundation-models) or an orchestration service deployment.
+        # Anthropic models use /anthropic/v1/messages; orchestration uses /completion.
+        self._is_anthropic = (
+            model_id.lower().startswith("anthropic--")
+            or "claude" in model_id.lower()
+        )
+        # Always use the orchestration service /completion endpoint.
+        # Foundation-model deployments (scenarioId: foundation-models) are backing resources
+        # only — they cannot be called directly. The orchestration deployment (scenarioId:
+        # orchestration) routes to Claude via SAP_AICORE_DEPLOYMENT_ID = orchestration ID.
         self.inference_url = f"{self.url}/v2/inference/deployments/{self.deployment_id}/completion"
 
-        logger.info(f"SAP AI Core Agent configured - model: {model_id}, deployment: {deployment_id}")
+        logger.info(
+            "SAP AI Core Agent configured - model: %s, deployment: %s, mode: %s, resource_group: %s",
+            model_id, deployment_id,
+            'anthropic-direct' if self._is_anthropic else 'orchestration',
+            self._resource_group,
+        )
 
     # ── Schema-hint helpers (used by _fetch_real_data) ───────────────────────
 
@@ -302,9 +331,14 @@ class SAPAICoreAgent:
         self,
         entity_data: dict,
         current_view: str,
+        app_id: Optional[str] = None,
     ) -> Optional[str]:
-        """Infer an OData FK filter using CAP naming convention when the field list
-        is unavailable (cross-service entity).
+        """Infer an OData FK filter for the target entity using the view URL.
+
+        Priority:
+          1. Look up the REAL FK field from entity_associations in the registry
+             (exact, works for any CAP app regardless of field naming).
+          2. Fall back to the CAP `to_<ParentEntity>_<keyField>` convention guess.
         """
         import re as _re
         if not entity_data or not current_view:
@@ -347,21 +381,176 @@ class SAPAICoreAgent:
         ed_k, ed_v = key_candidates[0]
 
         target_entity = getattr(self, '_current_fetch_entity', None)
+
+        # ── Same entity: self-filter using own key (e.g. viewing FertilizerBlend) ──
+        # Append IsActiveEntity eq true for draft-enabled entities so we read the saved
+        # record, never an in-progress draft with default/placeholder values.
         if target_entity and target_entity.lower() == _view_entity.lower():
+            _active = ""
+            if app_id:
+                try:
+                    from app.api.apps import _service_tool_registry
+                    for _svc in _service_tool_registry.get(app_id, []):
+                        _ef = (_svc.get("entity_fields") or {}).get(target_entity)
+                        if _ef and any(x.lower() == "isactiveentity" for x in _ef):
+                            _active = " and IsActiveEntity eq true"
+                            break
+                except Exception:
+                    pass
             if isinstance(ed_v, (int, float)):
-                return f"{ed_k} eq {_val_str(ed_v)}"
+                return f"{ed_k} eq {_val_str(ed_v)}{_active}"
             iv = _try_int(ed_v)
             if iv is not None:
-                return f"{ed_k} eq {iv}"
-            return f"{ed_k} eq '{ed_v}'"
+                return f"{ed_k} eq {iv}{_active}"
+            return f"{ed_k} eq '{ed_v}'{_active}"
 
+        # ── Pass 1: Look up the ACTUAL FK field from entity_associations in the registry ──
+        # This avoids guessing and works for every CAP app regardless of how it names FKs.
+        if app_id and target_entity:
+            try:
+                from app.api.apps import _service_tool_registry
+                for _svc in _service_tool_registry.get(app_id, []):
+                    for assoc in _svc.get("entity_associations", []):
+                        src = assoc.get("source", "")
+                        tgt = assoc.get("target", "")
+                        if (src.lower() == target_entity.lower() and
+                                tgt.lower() == _view_entity.lower()):
+                            fk_field = assoc["fk_field"]
+                            is_int = assoc.get("is_integer_key", False)
+                            if is_int or isinstance(ed_v, (int, float)):
+                                iv = _try_int(ed_v)
+                                val = str(iv if iv is not None else _val_str(ed_v))
+                                return f"{fk_field} eq {val}"
+                            return f"{fk_field} eq '{ed_v}'"
+            except Exception as _e:
+                logger.debug("[ctx_filter_view] registry lookup failed: %s", _e)
+
+        # ── Pass 2: guess via CAP to_<Parent>_<key> convention, VALIDATED against
+        #            the target entity's real fields so we never emit a filter on a
+        #            field the entity lacks (e.g. SalesOrder has no to_FertilizerBlend_*).
         fk_field = f"to_{_view_entity}_{ed_k}"
+
+        # Look up the target entity's actual fields from the registry (if known).
+        _target_fields: Optional[list] = None
+        if app_id and target_entity:
+            try:
+                from app.api.apps import _service_tool_registry
+                _tgt_lower = target_entity.lower()
+                for _svc in _service_tool_registry.get(app_id, []):
+                    for _en, _ef in (_svc.get("entity_fields") or {}).items():
+                        if _en.lower() == _tgt_lower:
+                            _target_fields = _ef
+                            break
+                    if _target_fields is not None:
+                        break
+            except Exception as _e:
+                logger.debug("[ctx_filter_view] field validation lookup failed: %s", _e)
+
+        if _target_fields is not None:
+            # We know the entity's fields — only emit a filter on a real FK back to the view entity.
+            _prefix = f"to_{_view_entity}_".lower()
+            _fset = {f.lower() for f in _target_fields}
+            if fk_field.lower() in _fset:
+                pass  # exact convention field exists — use it as-is
+            else:
+                _match = next((f for f in _target_fields if f.lower().startswith(_prefix)), None)
+                if not _match:
+                    logger.info(
+                        "[ctx_filter_view] target entity %r has no FK to view entity %r "
+                        "(no '%s*' field) — skipping context filter",
+                        target_entity, _view_entity, f"to_{_view_entity}_",
+                    )
+                    return None
+                fk_field = _match  # use the entity's real FK field name
+
         if isinstance(ed_v, (int, float)):
             return f"{fk_field} eq {_val_str(ed_v)}"
         iv = _try_int(ed_v)
         if iv is not None:
             return f"{fk_field} eq {iv}"
         return f"{fk_field} eq '{ed_v}'"
+
+    async def _fetch_key_values(
+        self,
+        entity: str,
+        key_field: str,
+        odata_filter: Optional[str],
+        service_url: str,
+        odata_token: Optional[str],
+    ) -> list:
+        """Fetch key field values from an entity with an optional filter.
+
+        Used for chained multi-entity queries:  get parent IDs first, then build
+        the FK filter for the child entity.  Returns a flat list of values.
+        """
+        import aiohttp as _aio
+        from urllib.parse import urlencode, quote as _q
+
+        if not service_url or not entity or not key_field:
+            return []
+
+        params: dict = {"$top": "200", "$select": key_field}
+        if odata_filter:
+            params["$filter"] = odata_filter
+
+        def _qs(p: dict) -> str:
+            return urlencode({k: str(v) for k, v in p.items()}, quote_via=_q)
+
+        url = f"{service_url.rstrip('/')}/{entity}?{_qs(params)}"
+        headers: dict = {"Accept": "application/json"}
+        if odata_token:
+            headers["Authorization"] = (
+                f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
+            )
+
+        try:
+            async with _aio.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers, timeout=_aio.ClientTimeout(total=8)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("value", [])
+                        return [
+                            row[key_field]
+                            for row in rows
+                            if key_field in row and row[key_field] is not None
+                        ]
+        except Exception as e:
+            logger.debug("[fetch_key_values] %s.%s: %s", entity, key_field, e)
+        return []
+
+    def _get_chain_association(
+        self,
+        child_entity: str,
+        available_parents: list,
+        app_id: Optional[str],
+    ) -> Optional[tuple]:
+        """Return (fk_field, parent_entity, key_field, is_integer_key) when child has
+        an association pointing to one of the available_parents in the registry.
+        """
+        if not app_id:
+            return None
+        import re as _re
+        try:
+            from app.api.apps import _service_tool_registry
+            for svc in _service_tool_registry.get(app_id, []):
+                for assoc in svc.get("entity_associations", []):
+                    src = assoc.get("source", "")
+                    tgt = assoc.get("target", "")
+                    if src.lower() != child_entity.lower():
+                        continue
+                    for parent in available_parents:
+                        if tgt.lower() == parent.lower():
+                            fk = assoc["fk_field"]
+                            is_int = assoc.get("is_integer_key", False)
+                            # Key field is the part after the last underscore
+                            m = _re.match(r'to_\w+_(\w+)$', fk, _re.IGNORECASE)
+                            key_field = m.group(1) if m else fk
+                            return (fk, parent, key_field, is_int)
+        except Exception as e:
+            logger.debug("[chain_assoc] %s", e)
+        return None
 
     def _parse_fields_from_rag(self, entity: str, rag_context: str) -> list:
         """Extract field names for a specific entity from RAG context text.
@@ -525,6 +714,424 @@ class SAPAICoreAgent:
             lines.append(f"    {k}: {v}")
         return "\n".join(lines)
 
+    # ── Code-list (sap.common.CodeList) resolution ────────────────────────────
+    # SAP CAP models value lists (status, priority, type, UoM, …) as CodeList
+    # entities with {code, name, descr, texts, localized}.  Consuming entities
+    # store the raw code in a `[to_]<core>_code` field.  End users must never see
+    # raw codes (001/002), so we translate generically:
+    #   • query side  : "open"  → to_blendStatus_code eq '001'   (label → code)
+    #   • render side : 001     → "Open"                          (code  → label)
+    # Detection is purely convention-based, so it works for ANY CAP app.
+
+    # Field-set signature of a CodeList projection (lower-cased).
+    _CL_ALLOWED = {
+        "code", "name", "descr", "description", "text", "texts", "localized",
+        "order", "value", "title", "short", "medium", "long", "name_text",
+    }
+    _CL_LABEL_FIELDS = ["name", "descr", "description", "text", "title", "value", "long", "medium", "short"]
+
+    def _normalize_codelist_name(self, name: str) -> str:
+        """Normalize an entity / FK-core name for fuzzy code-list matching:
+        lower-case, drop a `.texts` suffix, drop a trailing version tag (V1/V2),
+        and strip non-alphanumerics.  Plurals are handled at compare time."""
+        import re as _re
+        n = (name or "").lower().split(".")[0]
+        n = _re.sub(r'v\d+$', '', n)          # BlendStatusV1 -> blendstatus
+        n = _re.sub(r'[^a-z0-9]', '', n)
+        return n
+
+    def _get_code_catalog(self, app_id: Optional[str]) -> Optional[dict]:
+        """Build (and cache) the app's code-list catalog from the service registry.
+
+        Returns {"by_core": {normalized_core: entity_name}, "names": set(lower names)}.
+        A registered entity is treated as a code list when its field set matches the
+        CodeList signature (contains `code`, has a label field, and no extra columns).
+        """
+        if not app_id:
+            return None
+        cached = self._code_catalog_cache.get(app_id)
+        if cached is not None:
+            return cached
+
+        # by_core maps a normalized core name → (entity_name, registered_service_url).
+        catalog: dict = {"by_core": {}, "names": set()}
+        try:
+            from app.api.apps import _service_tool_registry
+            for svc in _service_tool_registry.get(app_id, []):
+                svc_url = svc.get("service_url", "")
+                for ent, flds in (svc.get("entity_fields") or {}).items():
+                    fset = {f.lower() for f in (flds or [])}
+                    if (
+                        fset
+                        and "code" in fset
+                        and fset <= self._CL_ALLOWED
+                        and any(lf in fset for lf in self._CL_LABEL_FIELDS)
+                        and len(fset) <= 7
+                    ):
+                        core = self._normalize_codelist_name(ent)
+                        if not core:
+                            continue
+                        catalog["names"].add(ent.lower())
+                        # Index by core and by its singular form so both
+                        # "dispatchMethod" and "dispatchMethods" resolve.
+                        catalog["by_core"].setdefault(core, (ent, svc_url))
+                        catalog["by_core"].setdefault(core.rstrip("s"), (ent, svc_url))
+        except Exception as e:
+            logger.debug("[codelist] catalog build failed for %s: %s", app_id, e)
+
+        self._code_catalog_cache[app_id] = catalog
+        if catalog["by_core"]:
+            logger.info(
+                "[codelist] catalog for %s: %d code lists (%s)",
+                app_id, len(catalog["names"]), ", ".join(sorted(catalog["names"]))[:200],
+            )
+        return catalog
+
+    def _codelist_for_field(self, field: str, catalog: dict) -> Optional[tuple]:
+        """Map a `[to_]<core>_code` field to (code_list_entity, service_url), or None."""
+        import re as _re
+        if not catalog or not catalog.get("by_core"):
+            return None
+        core = field
+        if core.lower().startswith("to_"):
+            core = core[3:]
+        core = _re.sub(r'(?i)_code$', '', core)
+        cn = self._normalize_codelist_name(core)
+        if not cn:
+            return None
+        for key in (cn, cn.rstrip("s")):
+            if key in catalog["by_core"]:
+                return catalog["by_core"][key]
+        return None
+
+    async def _load_code_list(
+        self,
+        app_id: str,
+        entity: str,
+        cl_service_url: str,
+        main_abs_url: str,
+        odata_token: Optional[str],
+    ) -> tuple:
+        """Fetch a code list once and cache (forward {code: label}, reverse {label_lower: code}).
+
+        `cl_service_url` is the code list's registered service URL (may be relative);
+        it is resolved against `main_abs_url`'s origin so cross-service code lists work.
+        Code lists are tiny and CAP returns `name`/`descr` already localized — a plain GET suffices.
+        """
+        key = (app_id, entity)
+        if key in self._code_list_cache:
+            return self._code_list_cache[key]
+
+        forward: dict = {}
+        reverse: dict = {}
+        try:
+            import aiohttp as _aio
+            from urllib.parse import urlencode, quote as _q, urlparse
+
+            # Resolve the code list's base URL.
+            base = cl_service_url or main_abs_url
+            if base and not base.lower().startswith("http"):
+                _p = urlparse(main_abs_url)
+                if _p.scheme and _p.netloc:
+                    base = f"{_p.scheme}://{_p.netloc}{base if base.startswith('/') else '/' + base}"
+                else:
+                    base = main_abs_url  # can't resolve origin — fall back to main
+            url = f"{base.rstrip('/')}/{entity}?{urlencode({'$top': '500'}, quote_via=_q)}"
+            headers: dict = {"Accept": "application/json"}
+            if odata_token:
+                headers["Authorization"] = (
+                    f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
+                )
+            async with _aio.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers, timeout=_aio.ClientTimeout(total=8)
+                ) as resp:
+                    if resp.status == 200:
+                        for row in (await resp.json()).get("value", []):
+                            code = row.get("code")
+                            if code is None:
+                                continue
+                            code_s = str(code)
+                            label = next(
+                                (row[lf] for lf in self._CL_LABEL_FIELDS
+                                 if row.get(lf) not in (None, "")),
+                                code_s,
+                            )
+                            forward[code_s] = str(label)
+                            reverse[str(label).lower()] = code_s
+                    else:
+                        logger.debug("[codelist] load %s -> HTTP %s", entity, resp.status)
+        except Exception as e:
+            logger.debug("[codelist] load failed for %s: %s", entity, e)
+
+        self._code_list_cache[key] = (forward, reverse)
+        return forward, reverse
+
+    async def _translate_filter_codes(
+        self,
+        odata_filter: Optional[str],
+        app_id: Optional[str],
+        service_url: str,
+        odata_token: Optional[str],
+    ) -> Optional[str]:
+        """Rewrite `<field>_code eq '<label>'` clauses to use the real code so a
+        user can filter by human terms ("open") instead of developer codes ("001")."""
+        if not odata_filter or not app_id:
+            return odata_filter
+        catalog = self._get_code_catalog(app_id)
+        if not catalog or not catalog.get("by_core"):
+            return odata_filter
+
+        import re as _re
+        clauses = _re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s+eq\s+'([^']*)'", odata_filter)
+        result = odata_filter
+        for field, val in clauses:
+            hit = self._codelist_for_field(field, catalog)
+            if not hit:
+                continue
+            entity, cl_svc = hit
+            forward, reverse = await self._load_code_list(
+                app_id, entity, cl_svc, service_url, odata_token
+            )
+            if not forward or val in forward:
+                continue  # nothing to map, or value is already a valid code
+            real = reverse.get(val.lower())
+            if real and real != val:
+                result = result.replace(f"{field} eq '{val}'", f"{field} eq '{real}'")
+                logger.info(
+                    "[codelist] filter translate: %s '%s' -> '%s' (via %s)",
+                    field, val, real, entity,
+                )
+        return result
+
+    async def _resolve_row_codes(
+        self,
+        rows: list,
+        app_id: Optional[str],
+        service_url: str,
+        odata_token: Optional[str],
+    ) -> list:
+        """Replace raw code values in fetched rows with their human labels in-place,
+        so the data block handed to the LLM (and thus the user) shows 'Open', not '001'."""
+        if not rows or not app_id:
+            return rows
+        catalog = self._get_code_catalog(app_id)
+        if not catalog or not catalog.get("by_core"):
+            return rows
+
+        # Identify *_code columns present, map each to its code list, load once.
+        code_keys: set = set()
+        for row in rows:
+            if isinstance(row, dict):
+                code_keys.update(k for k in row.keys() if k.lower().endswith("_code"))
+        key_maps: dict = {}
+        for k in code_keys:
+            hit = self._codelist_for_field(k, catalog)
+            if not hit:
+                continue
+            entity, cl_svc = hit
+            forward, _ = await self._load_code_list(
+                app_id, entity, cl_svc, service_url, odata_token
+            )
+            if forward:
+                key_maps[k] = forward
+        if not key_maps:
+            return rows
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for k, forward in key_maps.items():
+                v = row.get(k)
+                if v is None:
+                    continue
+                label = forward.get(str(v))
+                if label and label != str(v):
+                    row[k] = label
+        return rows
+
+    def _prettify_column(self, col: str) -> str:
+        """Render a developer field name as an end-user-friendly column header:
+        drop `to_` / `_code`, split camelCase and underscores, Title-Case."""
+        import re as _re
+        c = col
+        if c.lower().startswith("to_"):
+            c = c[3:]
+        c = _re.sub(r'(?i)_code$', '', c)
+        c = c.replace("_", " ")
+        c = _re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', c).strip()
+        if not c:
+            return col
+        return " ".join(w[:1].upper() + w[1:] for w in c.split())
+
+    def _reconcile_reachable(
+        self,
+        fetches: list,
+        message: str,
+        view_entity: Optional[str],
+        related_entities: list,
+        view_keys: dict,
+        view_fields: Optional[list] = None,
+    ) -> list:
+        """Safety net for '<X> and <Y> for this <view>' questions.
+
+        Goal: never DEGRADE a good plan — only repair a bad one.  We keep the planner's
+        reachable (navigable-from-view) picks as-is, DROP entities that aren't reachable
+        from the current view (e.g. BusinessPartnerFarms for a blend query), and ADD any
+        reachable entity the question clearly names but the planner missed.  Additionally,
+        when the question is about one of the VIEW ENTITY's own scalar fields (e.g. "how
+        many batches", "acres"), we fetch the current record itself so the answer is
+        grounded in real data instead of being hallucinated.
+        No-op when the question isn't about the current record.
+        """
+        import re as _re
+        if not view_entity or not view_keys:
+            return fetches
+        if not related_entities and not view_fields:
+            return fetches
+        msg_l = (message or "").lower()
+        # Must reference the record on screen.
+        if not _re.search(r'\b(this|current|its|their|here|above|displayed)\b', msg_l):
+            return fetches
+        msg_norm = _re.sub(r'[^a-z0-9]', '', msg_l)
+
+        def _words(name: str) -> list:
+            return [w.lower() for w in _re.findall(r'[A-Z]?[a-z0-9]+', name or "") if len(w) >= 3]
+
+        # Words belonging to the view entity itself (e.g. fertilizer, blend) must not
+        # trigger a reachable match — "this blend's details" is about the view entity.
+        view_words = set(_words(view_entity))
+        reachable = [t for _nav, t, _rev in related_entities]
+        reachable_lower = {t.lower() for t in reachable}
+        scopable = {t for _nav, t, _rev in related_entities if _rev}  # has to_<View>_* FK
+
+        freq: dict = {}
+        ent_words: dict = {}
+        for t in reachable:
+            ws = _words(t)
+            ent_words[t] = ws
+            for w in set(ws):
+                freq[w] = freq.get(w, 0) + 1
+
+        # Term-match each reachable entity to the question.
+        matched: list = []
+        for t in reachable:
+            distinctive = [
+                w for w in ent_words[t]
+                if freq.get(w) == 1 and w not in view_words
+            ]
+            hit = any(
+                (w in msg_l) or (w.rstrip("s") in msg_l) or ((w + "s") in msg_l)
+                for w in distinctive
+            )
+            if not hit:
+                tnorm = _re.sub(r'[^a-z0-9]', '', t.lower())
+                if tnorm and tnorm in msg_norm:
+                    hit = True
+            if hit and t not in matched:
+                matched.append(t)
+
+        # Promote a non-scopable match (e.g. master 'Farms') to its scopable child
+        # ('SelectedFarms', which carries the to_<View>_* FK) when one exists — that
+        # is the entity that can actually be filtered to the current record.
+        promoted: list = []
+        for t in matched:
+            if t in scopable:
+                promoted.append(t)
+                continue
+            child = next(
+                (r for r in scopable
+                 if r != t and r.lower().endswith(t.lower())),
+                None,
+            )
+            promoted.append(child or t)
+
+        # Suffix-dedup: prefer the more specific name — drop 'Farms' when 'SelectedFarms'
+        # also matched (Farms is a suffix of SelectedFarms).
+        intended = [
+            t for t in dict.fromkeys(promoted)
+            if not any(o != t and o.lower().endswith(t.lower()) for o in promoted)
+        ]
+
+        def _resolves_reachable(e: str) -> bool:
+            el = (e or "").lower()
+            if not el:
+                return False
+            if el in reachable_lower:
+                return True
+            return any(r.endswith(el) or r.endswith(el.rstrip("s")) for r in reachable_lower)
+
+        # Merge: keep planner's reachable picks (preserve their filters), drop the rest,
+        # then append any clearly-named reachable entity the planner left out.  Only drop
+        # when we actually know the reachable set — otherwise keep the planner's plan.
+        final: list = []
+        seen: set = set()
+        if related_entities:
+            for item in fetches:
+                e = (item.get("entity") or "").strip()
+                if e and _resolves_reachable(e) and e.lower() not in seen:
+                    final.append(item)
+                    seen.add(e.lower())
+            for t in intended:
+                if t.lower() not in seen:
+                    final.append({"entity": t, "filter": None})
+                    seen.add(t.lower())
+        else:
+            for item in fetches:
+                e = (item.get("entity") or "").strip()
+                if e and e.lower() not in seen:
+                    final.append(item)
+                    seen.add(e.lower())
+
+        # ── View-entity self-field fetch ─────────────────────────────────────
+        # When the question targets one of the VIEW ENTITY's OWN scalar fields
+        # (e.g. "how many batches", "acres", "status" — fields that live on the
+        # record itself, not on a child), fetch the current record so the answer is
+        # grounded in real data instead of hallucinated.
+        child_nouns: set = set()
+        for t in reachable:
+            child_nouns.update(ent_words.get(t, []))
+        _MANAGED = {"isactiveentity", "hasactiveentity", "hasdraftentity",
+                    "createdat", "createdby", "modifiedat", "modifiedby"}
+        view_field_hit = False
+        for f in (view_fields or []):
+            fl = f.lower()
+            if fl.startswith("to_") or fl in _MANAGED:
+                continue
+            for tok in _words(f):
+                if (
+                    len(tok) >= 4 and tok not in view_words and tok not in child_nouns
+                    and ((tok in msg_l) or (tok.rstrip("s") in msg_l) or ((tok + "s") in msg_l))
+                ):
+                    view_field_hit = True
+                    break
+            if view_field_hit:
+                break
+
+        if view_field_hit and not any(
+            (it.get("entity") or "").lower() == view_entity.lower() for it in final
+        ):
+            _kf, _kv = next(iter(view_keys.items()))
+            if isinstance(_kv, float) and _kv == int(_kv):
+                _key_clause = f"{_kf} eq {int(_kv)}"
+            elif isinstance(_kv, (int, float)) or str(_kv).isdigit():
+                _key_clause = f"{_kf} eq {_kv}"
+            else:
+                _key_clause = f"{_kf} eq '{_kv}'"
+            if any(x.lower() == "isactiveentity" for x in (view_fields or [])):
+                _key_clause += " and IsActiveEntity eq true"
+            final.append({"entity": view_entity, "filter": _key_clause})
+            logger.info("[planner] view-entity self-fetch: %s (%s)", view_entity, _key_clause)
+
+        if not final:
+            return fetches  # nothing matched — defer to the planner
+        if [f.get("entity") for f in final] != [f.get("entity") for f in fetches]:
+            logger.info(
+                "[planner] reachable reconciliation: %s -> %s",
+                [f.get("entity") for f in fetches], [f.get("entity") for f in final],
+            )
+        return final
+
 
     async def _llm_plan_fetch(
         self,
@@ -592,6 +1199,76 @@ class SAPAICoreAgent:
                 continue
             _deduped_entities.append(ent_name)
 
+        # Build association map: entity → [(fk_field, target_entity)] from registry
+        _assoc_map: dict = {}
+        if app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                for _sv in _service_tool_registry.get(app_id, []):
+                    for _as in _sv.get("entity_associations", []):
+                        _assoc_map.setdefault(_as["source"], []).append(
+                            (_as["fk_field"], _as["target"])
+                        )
+            except Exception:
+                pass
+
+        # ── Current-view reachable entities (navigation targets) ─────────────
+        # The #1 cause of wrong/dropped entities in "<X> and <Y> for this <view>"
+        # queries is that the planner doesn't know WHICH entities are reachable
+        # from the entity on screen.  Surface the view entity's navigation targets
+        # explicitly so it stops guessing (e.g. SelectedFarms, not BusinessPartnerFarms).
+        _view_entity_name: Optional[str] = None
+        if current_view:
+            _vm = _re.search(r'[/#]([A-Za-z][A-Za-z0-9]+)[\(/#?]', current_view)
+            if _vm:
+                _view_entity_name = _vm.group(1)
+
+        # [(nav_field, target_entity, has_reverse_fk)] — has_reverse_fk marks a true
+        # SCOPABLE CHILD (it carries a to_<ViewEntity>_* FK), vs a master/value-help nav.
+        _related_entities: list = []
+        _view_keys: dict = self._parse_keys_from_view_url(current_view) if current_view else {}
+        _view_fields: list = []     # the view entity's own fields (for self-field queries)
+        if _view_entity_name and app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                _code_names = (self._get_code_catalog(app_id) or {}).get("names", set())
+                _ent_actual: dict = {}        # lower name -> actual name
+                _ent_fields_map: dict = {}    # lower name -> [fields]
+                for _sv in _service_tool_registry.get(app_id, []):
+                    for _e, _f in (_sv.get("entity_fields") or {}).items():
+                        _ent_actual.setdefault(_e.lower(), _e)
+                        _ent_fields_map.setdefault(_e.lower(), _f)
+                        if _e.lower() == _view_entity_name.lower() and not _view_fields:
+                            _view_fields = _f
+                _rev_fk_prefix = f"to_{_view_entity_name}_".lower()
+                _seen_t: set = set()
+                for _f in _view_fields:
+                    if not _f.lower().startswith("to_"):
+                        continue
+                    _core = _f[3:]
+                    for _cand in (_core, _core + "s", _core[:-1] if _core.endswith("s") else _core):
+                        _actual = _ent_actual.get(_cand.lower())
+                        if (
+                            _actual
+                            and _actual.lower() != _view_entity_name.lower()
+                            and _actual.lower() not in _code_names
+                            and _actual not in _seen_t
+                        ):
+                            _tgt_flds = _ent_fields_map.get(_actual.lower(), [])
+                            _has_rev = any(
+                                _fld.lower().startswith(_rev_fk_prefix) for _fld in _tgt_flds
+                            )
+                            _related_entities.append((_f, _actual, _has_rev))
+                            _seen_t.add(_actual)
+                            break
+            except Exception as _e:
+                logger.debug("[planner] related-entity build failed: %s", _e)
+
+        # Force reachable targets into the schema digest so the planner can pick them.
+        for _nav, _tgt, _rev in _related_entities:
+            if _tgt not in _deduped_entities:
+                _deduped_entities.insert(0, _tgt)
+
         schema_lines = []
         for ent_name in _deduped_entities:
             s = _entity_schema.get(ent_name, {})
@@ -607,7 +1284,16 @@ class SAPAICoreAgent:
                         break
             parts = []
             if s.get("keys"):   parts.append(f"keys=[{', '.join(s['keys'][:3])}]")
-            if s.get("fks"):    parts.append(f"fks=[{', '.join(s['fks'][:4])}]")
+            # Annotate FK fields with their target entity for chain-query guidance
+            if s.get("fks"):
+                fk_parts = []
+                for fk in s["fks"][:4]:
+                    target_ents = [tgt for fld, tgt in _assoc_map.get(ent_name, []) if fld == fk]
+                    if target_ents:
+                        fk_parts.append(f"{fk}->{target_ents[0]}")
+                    else:
+                        fk_parts.append(fk)
+                parts.append(f"fks=[{', '.join(fk_parts)}]")
             if s.get("sample"): parts.append(f"fields=[{', '.join(s['sample'][:3])}]")
             suffix = f"  ({'; '.join(parts)})" if parts else ""
             schema_lines.append(f"  - {ent_name}{suffix}")
@@ -648,25 +1334,86 @@ class SAPAICoreAgent:
             "     'farms and fields and areas' → 3 entries (SelectedFarms, SelectedFields, SelectedAreas)\n"
             "     'show me X, Y and Z' → 3 entries\n"
             "   NEVER collapse multiple requested entities into one single entry.\n\n"
-            "6. Return {\"fetches\":[]} for greetings / general / how-to questions.\n\n"
-            "7. When uncertain about the filter field, set filter to null.\n\n"
+            "6. REACHABLE ENTITIES — if a 'Reachable from current view' list is given,\n"
+            "   it shows the EXACT entities navigable from the entity on screen.  For\n"
+            "   '<things> for this <view>' questions, pick ONLY from that list and match\n"
+            "   each requested term to the closest reachable entity (e.g. 'farms' →\n"
+            "   SelectedFarms, NOT BusinessPartnerFarms).  Do not invent or pick\n"
+            "   similarly-named entities that are not reachable.\n\n"
+            "7. Return {\"fetches\":[]} for greetings / general / how-to questions.\n\n"
+            "8. When uncertain about the filter field, set filter to null.\n\n"
             "RESPOND WITH ONLY valid JSON (no markdown):\n"
             "{\"fetches\": [{\"entity\": \"EntityName\", \"filter\": \"OData expr or null\"}]}"
         )
 
+        # Reachable-entities hint for "<things> for this <view>" questions.
+        _related_block = ""
+        if _related_entities and _view_entity_name:
+            _key_desc = ", ".join(f"{k}={v}" for k, v in _view_keys.items())
+            _rel_lines = "\n".join(f"  - {tgt}  (via {nav})" for nav, tgt, _rev in _related_entities)
+            _related_block = (
+                f"\nReachable from current view {_view_entity_name}"
+                + (f" ({_key_desc})" if _key_desc else "")
+                + ":\n" + _rel_lines + "\n"
+                + "For 'X for this " + _view_entity_name + "' questions, pick from this list "
+                "and leave filter null (the parent scope is applied automatically).\n"
+            )
+
         planner_user = (
-            f"App entity schema:\n{schema_block}\n\n"
+            f"App entity schema:\n{schema_block}\n"
+            f"{_related_block}\n"
             f"Current view URL: {current_view or '(none)'}\n\n"
             f"User question: {message}"
         )
 
-        try:
+        # ── Response-content extraction (handles every orchestration shape) ──
+        def _extract_content(res: dict) -> tuple:
+            """Return (content, finish_reason) from any orchestration response shape."""
+            for choices in (
+                res.get("module_results", {}).get("llm", {}).get("choices"),
+                res.get("orchestration_result", {}).get("choices"),
+                res.get("choices"),
+            ):
+                if choices:
+                    msg = choices[0].get("message", {}) or {}
+                    return (msg.get("content", "") or "", choices[0].get("finish_reason", ""))
+            # Last-ditch flat fields
+            return (res.get("completion") or res.get("text") or "", "")
+
+        def _parse_plan(raw: str) -> Optional[list]:
+            """Parse the planner's JSON, tolerating markdown fences and surrounding prose."""
+            txt = (raw or "").strip()
+            if not txt:
+                return None
+            # Strip ```json ... ``` fences if present
+            if txt.startswith("```"):
+                _parts = txt.split("```")
+                if len(_parts) >= 2:
+                    txt = _parts[1]
+                    if txt.lstrip().lower().startswith("json"):
+                        txt = txt.lstrip()[4:]
+                    txt = txt.strip()
+            try:
+                return _json.loads(txt).get("fetches", [])
+            except Exception:
+                pass
+            # Recover the first {...} object embedded in prose
+            _m = _re.search(r'\{.*\}', txt, _re.DOTALL)
+            if _m:
+                try:
+                    return _json.loads(_m.group(0)).get("fetches", [])
+                except Exception:
+                    pass
+            return None
+
+        async def _call_planner_once() -> Optional[dict]:
             token = await self.auth_client.get_token()
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "AI-Resource-Group": "default",
+                "AI-Resource-Group": self._resource_group,
             }
+            # Orchestration service format — works for all models including Claude.
             payload = {
                 "orchestration_config": {
                     "module_configurations": {
@@ -687,38 +1434,46 @@ class SAPAICoreAgent:
                 },
                 "input_params": {"q": planner_user},
             }
-
             async with _aio.ClientSession() as session:
                 async with session.post(
                     self.inference_url,
                     json=payload,
                     headers=headers,
-                    timeout=_aio.ClientTimeout(total=20),
+                    timeout=_aio.ClientTimeout(total=45),
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning("[planner] LLM call failed: %s", resp.status)
-                        return []
-                    result = await resp.json()
+                        _err = await resp.text()
+                        logger.warning("[planner] LLM call failed: %s — %s", resp.status, _err[:300])
+                        return None
+                    return await resp.json()
 
-            # Extract content from orchestration response
-            content = ""
-            mr = result.get("module_results", {}).get("llm", {})
-            if mr.get("choices"):
-                content = mr["choices"][0].get("message", {}).get("content", "")
-            elif "orchestration_result" in result:
-                choices = result["orchestration_result"].get("choices", [])
-                if choices:
-                    content = choices[0].get("message", {}).get("content", "")
+        try:
+            # One retry: empty completions from the orchestration endpoint are transient.
+            for _attempt in (1, 2):
+                result = await _call_planner_once()
+                if result is None:
+                    return []  # non-200 — already logged, regex fallback handles it
+                content, finish_reason = _extract_content(result)
+                if content.strip():
+                    break
+                logger.warning(
+                    "[planner] attempt %d returned EMPTY content "
+                    "(finish_reason=%r, response_keys=%s, llm_keys=%s)",
+                    _attempt, finish_reason, list(result.keys()),
+                    list(result.get("module_results", {}).get("llm", {}).keys()),
+                )
 
-            content = content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            content = content.strip()
-
-            plan = _json.loads(content)
-            fetches = plan.get("fetches", [])
+            fetches = _parse_plan(content)
+            if fetches is None:
+                logger.warning(
+                    "[planner] could not parse plan from content (len=%d): %r — falling back to regex",
+                    len(content or ""), (content or "")[:300],
+                )
+                return []
+            # Deterministic reachable-entity reconciliation for "X for this <view>".
+            fetches = self._reconcile_reachable(
+                fetches, message, _view_entity_name, _related_entities, _view_keys, _view_fields
+            )
             logger.info("[planner] plan: %s", fetches)
             return fetches
 
@@ -958,15 +1713,44 @@ class SAPAICoreAgent:
 
         if planned_entity:
             _pe_lower = planned_entity.lower()
+
+            # Resolve the correct service URL via FK-target scoring instead of home-score.
+            # home-score gives 0 for entities whose name doesn't match the service URL slug
+            # (e.g. SelectedFarms vs fertilizer-blend), so the first-processed service wins
+            # arbitrarily.  When a filter like "to_FertilizerBlend_orderID eq 2414" is present,
+            # we prefer the service that contains BOTH the entity AND the FK target entity.
+            _best_planned_svc: Optional[str] = None
+            if app_id:
+                try:
+                    import re as _sre2
+                    from app.api.apps import _service_tool_registry as _str2
+                    _fk_m2 = _sre2.match(r'to_([A-Za-z]+)_', planned_filter or "")
+                    _fk_tgt_lc = _fk_m2.group(1).lower() if _fk_m2 else None
+                    _psvc_cands: list = []
+                    for _psv in _str2.get(app_id, []):
+                        _psv_ents_lc = {e.lower() for e in _psv.get("entities", [])}
+                        if _pe_lower not in _psv_ents_lc:
+                            continue
+                        _fk_hit = bool(_fk_tgt_lc and any(_fk_tgt_lc in e for e in _psv_ents_lc))
+                        _psvc_cands.append((2 if _fk_hit else 1, _psv.get("service_url", "")))
+                    if _psvc_cands:
+                        _psvc_cands.sort(key=lambda x: -x[0])
+                        _best_planned_svc = _psvc_cands[0][1] or None
+                except Exception:
+                    pass
+
             for ent in all_candidate_entities:
                 if ent.lower() == _pe_lower:
                     best_entity = ent
-                    best_service_url = _entity_to_service.get(ent, service_url)
+                    best_service_url = _best_planned_svc or _entity_to_service.get(ent, service_url)
                     break
             if not best_entity:
                 best_entity = planned_entity
-                best_service_url = _entity_to_service.get(planned_entity, service_url)
-            logger.info("[fetch_real_data] planner-resolved entity=%s filter=%s", best_entity, planned_filter)
+                best_service_url = _best_planned_svc or _entity_to_service.get(planned_entity, service_url)
+            logger.info(
+                "[fetch_real_data] planner-resolved entity=%s filter=%s svc=%s",
+                best_entity, planned_filter, best_service_url,
+            )
 
         # Pass 1: exact containment — scoped to PRIMARY NOUN when identifiable.
         # Rationale: "what are the saleorderitems for salesorder 2466?" contains
@@ -1167,7 +1951,7 @@ class SAPAICoreAgent:
                     # returned None — infer FK from CAP to_<Entity>_<key> naming convention.
                     if not _ctx_filter and _entity_data and _current_view:
                         _ctx_filter = self._build_context_filter_from_view(
-                            _entity_data, _current_view
+                            _entity_data, _current_view, app_id=app_id
                         )
                         if _ctx_filter:
                             logger.info(
@@ -1242,6 +2026,14 @@ class SAPAICoreAgent:
                     )
                     base = ""
             service_url = f"{base}{service_url}"
+
+        # ── Code-list filter translation: "open" → '001' (generic, any CAP app) ──
+        # A user filters by human terms; CAP stores codes.  Rewrite *_code clauses
+        # before counting/fetching so label-based filters actually match rows.
+        if odata_filter:
+            odata_filter = await self._translate_filter_codes(
+                odata_filter, app_id, service_url, odata_token
+            )
 
         logger.info(
             "[fetch_real_data] entity=%s service=%s filter=%s expand=%s",
@@ -1373,6 +2165,13 @@ class SAPAICoreAgent:
             if count_val is None and rows_data is None:
                 return None
 
+            # ── Code-list value resolution: 001 → "Open" (generic, any CAP app) ──
+            # Replace raw codes with human labels so the user never sees 001/002.
+            if rows_data:
+                rows_data = await self._resolve_row_codes(
+                    rows_data, app_id, service_url, odata_token
+                )
+
             # ── Format output for the LLM ─────────────────────────────────────
             lines = [f"[Real data from OData — {best_entity}]"]
             applied = []
@@ -1450,7 +2249,9 @@ class SAPAICoreAgent:
                     )
 
                     if meaningful_keys:
-                        lines.append("| " + " | ".join(meaningful_keys) + " |")
+                        # End-user-friendly headers: to_blendStatus_code → "Blend Status"
+                        header_labels = [self._prettify_column(k) for k in meaningful_keys]
+                        lines.append("| " + " | ".join(header_labels) + " |")
                         lines.append("|" + "|".join("---" for _ in meaningful_keys) + "|")
                         for row in display:
                             cells = [str(row.get(k, "")) for k in meaningful_keys]
@@ -1583,9 +2384,24 @@ class SAPAICoreAgent:
             "use it. Only say an entity doesn't exist if the schema is present AND you have "
             "checked every entity in it and found no reasonable match.\n\n"
 
-            "3b. DATA UNAVAILABILITY\n"
+            "3c. VIRTUAL / COMPUTED FIELDS\n"
+            "   CAP applications can define virtual (computed) fields that are calculated\n"
+            "   server-side and returned in OData responses. These fields may NOT appear in\n"
+            "   the schema_hint but they WILL appear in the live-data block when the entity\n"
+            "   is queried. NEVER tell the user a field 'doesn't exist' or 'isn't available'\n"
+            "   just because it's absent from the schema hint — always query the entity and\n"
+            "   let the actual OData response determine what fields are present.\n\n"
+
+            "3b. DATA UNAVAILABILITY (CRITICAL \u2014 never fabricate)\n"
+            "   The '[Real data from OData \u2014 ...]' block is produced ONLY by the system and\n"
+            "   appears ABOVE the user's question. You must NEVER write that marker yourself,\n"
+            "   and you must NEVER state a specific field value (count, size, code, date, name)\n"
+            "   unless it appears verbatim in a system-provided block.\n"
             "   If no '[Real data from OData]' block is present in the message:\n"
-            "   a) Do NOT invent example rows, fake field values, or placeholder tables.\n"
+            "   a) Do NOT invent example rows, fake field values, placeholder tables, or a fake\n"
+            "      data block. Concretely: never output numbers like 'numberOfBatches: 4' or\n"
+            "      'sizeOfBatch: 100' that you did not receive \u2014 guessing real business data is a\n"
+            "      serious error, worse than admitting you don't have it.\n"
             "   b) Do NOT give raw OData URLs to business users.\n"
             "   c) Do NOT just say 'try again' or 'I wasn't able to retrieve' without more help.\n"
             "   d) Explain WHAT entity holds the data the user is asking for (name it from the schema),\n"
@@ -1608,13 +2424,17 @@ class SAPAICoreAgent:
             "Do not import entity names or field names from previous conversations or "
             "general SAP knowledge \u2014 the current app may have completely different entities.\n\n"
 
-            "7. PARENT \u2192 CHILD NAVIGATION\n"
-            "   When a user asks for child/related records (items, materials, components, lines):\n"
+            "7. PARENT \u2192 CHILD NAVIGATION & CHAINED QUERIES\n"
+            "   When a user asks for child/related records (items, materials, components, lines,\n"
+            "   fields, areas, or any nested entity chain):\n"
             "   a) Identify the CHILD entity from the schema \u2014 it will have a FK field referencing the parent.\n"
-            "   b) A live-data block for the child entity filtered by parent ID will be provided.\n"
-            "      Present it as a COMPLETE table \u2014 do not summarise to just the first row.\n"
-            "   c) If you receive parent-entity data but the user asked for child data, say:\n"
-            "      'The [child entity] data for this [parent] is separate \u2014 try asking: "
+            "   b) A live-data block for EACH level of the chain will be provided (parent, child, grandchild).\n"
+            "      Present ALL blocks as separate Markdown tables \u2014 one table per entity level.\n"
+            "      Label each table clearly: '**SelectedFarms** (3 records)', '**SelectedFields** (7 records)', etc.\n"
+            "   c) When multiple '[Real data from OData \u2014 EntityName]' blocks are present, show ALL of them\n"
+            "      in the response \u2014 do NOT collapse or merge different entities into one table.\n"
+            "   d) If you receive parent-entity data but the user asked for child data, say:\n"
+            "      'The [child entity] data for this [parent] is separate \u2014 try asking:\n"
             "      \"show me the [child] for [parent name/ID] [value]\"'\n\n"
 
             "8. COMPLETENESS\n"
@@ -1836,8 +2656,12 @@ class SAPAICoreAgent:
                     )
                     _item["filter"] = None
 
-            # Execute each planned fetch in PARALLEL and collect non-empty blocks
+            # ── Phase 1: Execute fetches that have a concrete filter in PARALLEL ─
             import asyncio as _asyncio
+
+            _phase1_items = [i for i in _fetch_plan if i.get("entity") and i.get("filter")]
+            _phase2_items = [i for i in _fetch_plan if i.get("entity") and not i.get("filter")]
+
             _fetch_tasks = [
                 self._fetch_real_data(
                     fiori_context, odata_token, _match_msg,
@@ -1847,10 +2671,139 @@ class SAPAICoreAgent:
                     planned_entity=_item.get("entity"),
                     planned_filter=_item.get("filter") or None,
                 )
-                for _item in _fetch_plan if _item.get("entity")
+                for _item in _phase1_items
             ]
             _results = await _asyncio.gather(*_fetch_tasks, return_exceptions=True)
             _blocks = [r for r in _results if isinstance(r, str) and r]
+
+            # ── Phase 2: Chained queries — resolve null-filter items using parent results ──
+            # For queries like "farms AND fields AND areas for blend X":
+            #   Phase 1 fetches farms (filter: to_FertilizerBlend_orderID eq 2466)
+            #   Phase 2 resolves fields (fk: to_SelectedFarms_farmID) by reading farm IDs,
+            #           then resolves areas (fk: to_SelectedFields_fieldID) from field IDs.
+            if _phase2_items:
+                _executed_entities = {i["entity"]: i.get("filter") for i in _phase1_items}
+                _phase2_service_url = (
+                    (fiori_context or {}).get("service_url") or
+                    (fiori_context or {}).get("serviceUrl") or ""
+                )
+                if not _phase2_service_url and app_id:
+                    try:
+                        from app.api.apps import _service_tool_registry
+                        _svcs = _service_tool_registry.get(app_id, [])
+                        if _svcs:
+                            _phase2_service_url = _svcs[0].get("service_url", "")
+                            _p2_base = _svcs[0].get("app_base_url", "")
+                            if _phase2_service_url.startswith("/") and _p2_base:
+                                _phase2_service_url = f"{_p2_base.rstrip('/')}{_phase2_service_url}"
+                    except Exception:
+                        pass
+
+                for _p2 in _phase2_items:
+                    _child = _p2["entity"]
+                    _chain = self._get_chain_association(
+                        _child, list(_executed_entities.keys()), app_id
+                    )
+                    if not _chain:
+                        # Determine if this entity is a root entity (no FK associations in registry)
+                        # or a child entity whose parent simply wasn't in Phase 1.
+                        _has_parent_fk = False
+                        if app_id:
+                            try:
+                                from app.api.apps import _service_tool_registry
+                                for _sv in _service_tool_registry.get(app_id, []):
+                                    for _as in _sv.get("entity_associations", []):
+                                        if _as.get("source", "").lower() == _child.lower():
+                                            _has_parent_fk = True
+                                            break
+                                    if _has_parent_fk:
+                                        break
+                            except Exception:
+                                pass
+                        # Root entity (no FKs) → always fetch standalone.
+                        # Child entity but Phase 1 ran nothing → also fetch standalone
+                        # (user asked for it directly with no parent context).
+                        if not _has_parent_fk or not _phase1_items:
+                            logger.info(
+                                "[chain] no chain for %s (has_parent_fk=%s, phase1_empty=%s)"
+                                " — fetching as standalone list-all",
+                                _child, _has_parent_fk, not bool(_phase1_items),
+                            )
+                            _solo_block = await self._fetch_real_data(
+                                fiori_context, odata_token, _match_msg,
+                                user_id, app_id,
+                                rag_context=rag_context,
+                                history=history,
+                                planned_entity=_child,
+                                planned_filter=None,
+                            )
+                            if isinstance(_solo_block, str) and _solo_block:
+                                _blocks.append(_solo_block)
+                        else:
+                            logger.info(
+                                "[chain] no chain for %s with Phase 1 context present — skipping",
+                                _child,
+                            )
+                        continue
+                    _fk_field, _parent_ent, _key_field, _is_int = _chain
+                    _parent_filter = _executed_entities.get(_parent_ent)
+
+                    # Resolve parent entity's service URL
+                    _parent_svc_url = _phase2_service_url
+                    if app_id:
+                        try:
+                            from app.api.apps import _service_tool_registry
+                            for _sv in _service_tool_registry.get(app_id, []):
+                                if _parent_ent in _sv.get("entities", []):
+                                    _ps = _sv.get("service_url", "")
+                                    _pb = _sv.get("app_base_url", "")
+                                    if _ps.startswith("/") and _pb:
+                                        _ps = f"{_pb.rstrip('/')}{_ps}"
+                                    if _ps:
+                                        _parent_svc_url = _ps
+                                    break
+                        except Exception:
+                            pass
+
+                    _parent_ids = await self._fetch_key_values(
+                        _parent_ent, _key_field, _parent_filter,
+                        _parent_svc_url, odata_token,
+                    )
+
+                    if not _parent_ids:
+                        logger.info("[chain] no parent IDs for %s → skipping %s", _parent_ent, _child)
+                        continue
+
+                    # Build OData `in` filter or fallback to `or` for <= 10 values
+                    if len(_parent_ids) <= 10:
+                        _or_clauses = [
+                            f"{_fk_field} eq {v}" if _is_int or isinstance(v, (int, float))
+                            else f"{_fk_field} eq '{v}'"
+                            for v in _parent_ids
+                        ]
+                        _child_filter = " or ".join(_or_clauses)
+                    else:
+                        _id_list = ",".join(str(v) for v in _parent_ids)
+                        _child_filter = f"{_fk_field} in ({_id_list})"
+
+                    logger.info(
+                        "[chain] %s→%s: parent_ids=%d filter=%s",
+                        _parent_ent, _child, len(_parent_ids), _child_filter[:80],
+                    )
+                    _p2["filter"] = _child_filter
+                    _executed_entities[_child] = _child_filter
+
+                    _chain_block = await self._fetch_real_data(
+                        fiori_context, odata_token, _match_msg,
+                        user_id, app_id,
+                        rag_context=rag_context,
+                        history=history,
+                        planned_entity=_child,
+                        planned_filter=_child_filter,
+                    )
+                    if isinstance(_chain_block, str) and _chain_block:
+                        _blocks.append(_chain_block)
+
             if _blocks:
                 live_data_block = "\n\n".join(_blocks)
 
@@ -1872,13 +2825,13 @@ class SAPAICoreAgent:
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "AI-Resource-Group": "default",
+            "AI-Resource-Group": self._resource_group,
         }
 
-        # Build orchestration template messages
-        template_messages = [
-            {"role": "system", "content": system_message},
-        ]
+        import json as _json
+
+        # Orchestration service format — works for Claude and all other models.
+        template_messages = [{"role": "system", "content": system_message}]
         if history:
             for msg in history[-10:]:
                 template_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
@@ -1889,7 +2842,7 @@ class SAPAICoreAgent:
                 "module_configurations": {
                     "llm_module_config": {
                         "model_name": self.model_id,
-                        "model_params": {"max_tokens": 4096, "temperature": 0.7, "top_p": 0.9}
+                        "model_params": {"max_tokens": 4096, "temperature": 0.7}
                     },
                     "templating_module_config": {"template": template_messages}
                 }
@@ -1907,13 +2860,11 @@ class SAPAICoreAgent:
                 if response.status != 200:
                     raise Exception(f"API error {response.status}: {response_text}")
 
-                import json as _json
                 try:
                     result = _json.loads(response_text)
                 except Exception:
                     raise Exception(f"Failed to parse API response: {response_text[:500]}")
 
-                # Parse orchestration response — log structure to diagnose extraction path
                 logger.info(f"API response keys: {list(result.keys())}")
 
                 content = ""
@@ -1934,12 +2885,10 @@ class SAPAICoreAgent:
                 elif "choices" in result and len(result["choices"]) > 0:
                     content = result["choices"][0].get("message", {}).get("content", "")
                     logger.info(f"Extracted via top-level choices ({len(content)} chars)")
-                # Path 4: fallback scalar fields
                 else:
                     content = result.get("completion") or result.get("text") or result.get("output") or ""
                     logger.warning(f"Fell back to scalar extraction, result keys: {list(result.keys())}")
                     if not content:
-                        # Last resort: dump so we can see the structure
                         logger.error(f"Could not extract content. Full response: {response_text[:1000]}")
 
                 response_time = (datetime.utcnow() - start_time).total_seconds()

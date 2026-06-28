@@ -38,10 +38,20 @@ class GlobalChatAgent:
 
             self._mode = "sap"
             self._model_id: str = settings.sap_aicore_model_id or "gpt-4o"
-            self._inference_url = (
-                f"{settings.sap_aicore_url.rstrip('/')}"
-                f"/v2/inference/deployments/{settings.sap_aicore_deployment_id}/completion"
+            _is_anthropic = (
+                self._model_id.lower().startswith("anthropic--")
+                or "claude" in self._model_id.lower()
             )
+            _base = settings.sap_aicore_url.rstrip("/")
+            _dep  = settings.sap_aicore_deployment_id
+            # Always use the orchestration /completion endpoint.
+            # Foundation-model deployments are backing resources only.
+            self._inference_url = f"{_base}/v2/inference/deployments/{_dep}/completion"
+            self._is_anthropic: bool = _is_anthropic
+            try:
+                self._resource_group: str = settings.sap_aicore_resource_group or "default"
+            except Exception:
+                self._resource_group = "default"
             self._auth = SAPAICoreAuth(
                 auth_url=settings.sap_aicore_auth_url,
                 client_id=settings.sap_aicore_client_id,
@@ -95,9 +105,10 @@ class GlobalChatAgent:
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "AI-Resource-Group": "default",
+            "AI-Resource-Group": self._resource_group,
         }
 
+        # Orchestration service format — same for all models.
         template_messages = [{"role": "system", "content": GLOBAL_SYSTEM_PROMPT}]
         for msg in (history or [])[-10:]:
             template_messages.append({
@@ -105,13 +116,12 @@ class GlobalChatAgent:
                 "content": msg.get("content", ""),
             })
         template_messages.append({"role": "user", "content": "{{?user_query}}"})
-
         payload = {
             "orchestration_config": {
                 "module_configurations": {
                     "llm_module_config": {
                         "model_name": self._model_id,
-                        "model_params": {"max_tokens": 2048, "temperature": 0.7, "top_p": 0.9},
+                        "model_params": {"max_tokens": 2048, "temperature": 0.7},
                     },
                     "templating_module_config": {"template": template_messages},
                 }
@@ -132,7 +142,7 @@ class GlobalChatAgent:
                     raise Exception(f"SAP AI Core error {resp.status}: {text}")
                 result = _json.loads(text)
 
-        # Extract content — same multi-path logic as SAPAICoreAgent
+        # Orchestration service response parsing
         content = ""
         mr = result.get("module_results", {}).get("llm", {})
         if "choices" in mr:
