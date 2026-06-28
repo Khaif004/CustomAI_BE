@@ -43,6 +43,7 @@ class UserInfo(BaseModel):
     user_id: str
     username: str
     email: Optional[str] = None
+    display_name: Optional[str] = None
 
 
 # In-memory user store (replace with real DB in production)
@@ -111,9 +112,29 @@ async def verify_access_token(current_user=Depends(get_current_user)):
 
 @router.get("/me", response_model=UserInfo, status_code=status.HTTP_200_OK)
 async def get_current_user_info(current_user=Depends(get_current_user)):
-    """Get current authenticated user info"""
-    return UserInfo(user_id=current_user["sub"], username=current_user.get("username", "unknown"),
-                    email=current_user.get("email"))
+    """Get current authenticated user info.
+
+    Supports both internal tokens (``username``/``sub``) and XSUAA tokens,
+    whose claims use ``user_name``/``given_name``/``family_name``/``email``.
+    """
+    username = (
+        current_user.get("user_name")
+        or current_user.get("username")
+        or current_user.get("email")
+        or current_user.get("sub")
+        or "unknown"
+    )
+    full_name = " ".join(
+        part for part in (current_user.get("given_name"), current_user.get("family_name")) if part
+    ).strip()
+    display_name = full_name or current_user.get("name") or username
+
+    return UserInfo(
+        user_id=current_user.get("sub") or username,
+        username=username,
+        email=current_user.get("email"),
+        display_name=display_name,
+    )
 
 
 @router.get("/dev/token", response_model=TokenResponse, status_code=status.HTTP_200_OK)
