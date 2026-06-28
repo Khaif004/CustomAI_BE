@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     # Separate deployment for text-embedding model (e.g. text-embedding-3-small)
     # If not set, falls back to sap_aicore_deployment_id
     sap_aicore_embedding_deployment_id: Optional[str] = None
+    # Resource group for SAP AI Core inference calls (AI-Resource-Group header).
+    # Check AI Launchpad → your AI API instance → Resource Groups for the correct value.
+    sap_aicore_resource_group: str = "default"
 
     jwt_secret_key: str = "dev-secret-key-change-in-production"
     jwt_algorithm: str = "HS256"

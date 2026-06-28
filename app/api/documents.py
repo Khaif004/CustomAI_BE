@@ -119,7 +119,7 @@ async def _call_sap_ai_core(prompt: str, settings) -> dict:
         async with session.post(
             inference_url,
             json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "AI-Resource-Group": "default"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "AI-Resource-Group": get_settings().sap_aicore_resource_group or "default"},
             timeout=aiohttp.ClientTimeout(total=120),
         ) as resp:
             text = await resp.text()
