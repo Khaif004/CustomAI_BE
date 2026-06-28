@@ -13,6 +13,8 @@ import json
 import re
 import time
 import logging
+import uuid as _uuid_module
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -152,6 +154,79 @@ async def _classify_doc_intent(message: str) -> str | None:
     except Exception as ex:
         logger.warning(f"LLM doc-intent classification failed: {ex}")
         return None
+
+def _save_chat_to_db_sync(
+    session_id: str,
+    app_id: Optional[str],
+    user_id: Optional[str],
+    user_message: str,
+    ai_response: str,
+) -> None:
+    """Persist chat session + both messages to Neon (chat_sessions / chat_messages tables).
+
+    Runs in a thread-pool executor so it never blocks the async event loop.
+    All DB errors are swallowed — message storage is best-effort and must not
+    break the streaming response.
+    """
+    try:
+        from app.api.apps import _neon_conn
+        conn = _neon_conn()
+        if not conn:
+            return
+        app_key = app_id or "__global__"
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    # 1. Ensure the application row exists (upsert)
+                    cur.execute(
+                        """
+                        INSERT INTO applications (application_key, name)
+                        VALUES (%s, %s)
+                        ON CONFLICT (application_key)
+                        DO UPDATE SET name = EXCLUDED.name
+                        RETURNING id
+                        """,
+                        (app_key, app_key),
+                    )
+                    app_uuid = str(cur.fetchone()[0])
+
+                    # 2. Upsert the chat session (idempotent on the same session_id)
+                    cur.execute(
+                        """
+                        INSERT INTO chat_sessions
+                            (id, application_id, user_id, user_subject, started_at)
+                        VALUES (%s::uuid, %s::uuid, %s, %s, NOW())
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (session_id, app_uuid, user_id, user_id),
+                    )
+
+                    # 3. User message
+                    cur.execute(
+                        """
+                        INSERT INTO chat_messages
+                            (id, session_id, role, content, created_at)
+                        VALUES (%s::uuid, %s::uuid, 'user', %s, NOW())
+                        """,
+                        (str(_uuid_module.uuid4()), session_id, user_message[:50_000]),
+                    )
+
+                    # 4. Assistant message
+                    cur.execute(
+                        """
+                        INSERT INTO chat_messages
+                            (id, session_id, role, content, created_at)
+                        VALUES (%s::uuid, %s::uuid, 'assistant', %s, NOW())
+                        """,
+                        (str(_uuid_module.uuid4()), session_id, ai_response[:50_000]),
+                    )
+        except Exception as db_err:
+            logger.warning("[chat_db] DB write error: %s", db_err)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[chat_db] Skipped (no Neon connection): %s", e)
+
 
 def _enrich_message_with_fiori_context(message: str, fiori_context: dict | None) -> str:
     """Prepend a structured context block to the user message when a Fiori app has sent entity data.
@@ -501,6 +576,10 @@ async def chat_stream(request: ChatRequest, http_request: Request, current_user=
     _backend_url = str(http_request.base_url).rstrip("/")
 
     async def event_generator():
+        # Use caller-supplied session_id or mint a new one for this conversation turn.
+        _session_id = request.session_id or str(_uuid_module.uuid4())
+        _response_buffer: list = []
+
         try:
             history = None
             if request.conversation_history:
@@ -584,6 +663,7 @@ async def chat_stream(request: ChatRequest, http_request: Request, current_user=
                         raw_message=request.message,
                         backend_url=_backend_url,
                     ):
+                        _response_buffer.append(chunk)
                         yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
                 else:
                     result = await chat_agent.get_response(
@@ -598,11 +678,26 @@ async def chat_stream(request: ChatRequest, http_request: Request, current_user=
                     )
                     words = result["response"].split(" ")
                     for i, word in enumerate(words):
-                        yield f"data: {json.dumps({'type': 'chunk', 'content': word if i == 0 else ' ' + word})}\n\n"
+                        chunk = word if i == 0 else ' ' + word
+                        _response_buffer.append(chunk)
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
                         await asyncio.sleep(0.03)
 
                 response_time = time.time() - start_time
-                yield f"data: {json.dumps({'type': 'done', 'model': model_name, 'response_time': round(response_time, 2)})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'model': model_name, 'response_time': round(response_time, 2), 'session_id': _session_id})}\n\n"
+
+                # ── Persist session + messages to Neon DB (best-effort, non-blocking) ─
+                _ai_text = "".join(_response_buffer)
+                if _ai_text:
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        _save_chat_to_db_sync,
+                        _session_id,
+                        request.app_id,
+                        _user_id,
+                        request.message,
+                        _ai_text,
+                    )
 
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)

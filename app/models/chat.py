@@ -31,6 +31,10 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500000)
     conversation_history: Optional[List[ChatMessage]] = None
     conversation_id: Optional[str] = None
+    session_id: Optional[str] = Field(
+        None,
+        description="Persistent chat session ID. If omitted the backend generates one and returns it in the 'done' SSE event.",
+    )
     project_context: Optional[str] = None
     stream: bool = False
     app_id: Optional[str] = Field(
