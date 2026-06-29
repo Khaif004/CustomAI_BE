@@ -1,8 +1,5 @@
 name: Deploy Backend to Cloud Foundry
 
-# Deploys the FastAPI backend to CF whenever code lands on main
-# (i.e. when a PR is merged). Can also be run manually from the Actions tab.
-# The Python buildpack builds remotely on CF, so there is no local build step.
 on:
   push:
     branches: [main]
@@ -27,10 +24,21 @@ jobs:
           cf version
 
       - name: Authenticate to Cloud Foundry
+        env:
+          CF_API: ${{ secrets.CF_API }}
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+          CF_ORG: ${{ secrets.CF_ORG }}
+          CF_SPACE: ${{ secrets.CF_SPACE }}
+          CF_ORIGIN: ${{ secrets.CF_ORIGIN }}
         run: |
-          cf api "${{ secrets.CF_API }}"
-          cf auth "${{ secrets.CF_USERNAME }}" "${{ secrets.CF_PASSWORD }}"
-          cf target -o "${{ secrets.CF_ORG }}" -s "${{ secrets.CF_SPACE }}"
+          cf api "$CF_API"
+          if [ -n "$CF_ORIGIN" ]; then
+            cf auth "$CF_USERNAME" "$CF_PASSWORD" --origin "$CF_ORIGIN"
+          else
+            cf auth "$CF_USERNAME" "$CF_PASSWORD"
+          fi
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
 
       - name: Verify xsuaa service exists
         run: |
@@ -39,52 +47,8 @@ jobs:
             exit 1;
           }
 
-      # Upload + stage the droplet but don't start yet, so we can set runtime
-      # env vars first. The backend's .env is NOT deployed (it's .cfignore'd),
-      # so the app reads ALL config from these process env vars at startup.
-      - name: Push (no start)
-        run: cf push -f manifest.yml --no-start
-
-      - name: Set runtime environment variables
-        env:
-          # ---- Non-sensitive operational config (edit here if it changes) ----
-          LLM_PROVIDER: sap_ai_core
-          SAP_AICORE_URL: https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com
-          SAP_AICORE_AUTH_URL: https://mgs-jouledev-26wflb7d.authentication.eu10.hana.ondemand.com
-          SAP_AICORE_MODEL_ID: anthropic--claude-4.6-sonnet
-          SAP_AICORE_DEPLOYMENT_ID: d088159df95524d3
-          SAP_AICORE_RESOURCE_GROUP: grounding
-          SAP_AICORE_EMBEDDING_DEPLOYMENT_ID: d5183dce08f76765
-          EMBEDDING_MODEL: text-embedding-3-small
-          APP_NAME: Joule Replacement
-          APP_VERSION: 0.1.0
-          DEBUG: "true"
-          LOG_LEVEL: INFO
-          JWT_ALGORITHM: HS256
-          ALLOWED_ORIGINS: http://localhost:3000,http://localhost:5173,http://localhost:4004
-          ENABLE_CONVERSATION_MEMORY: "true"
-          ENABLE_MULTI_AGENT_ORCHESTRATION: "true"
-          XSUAA_ISSUER: https://msgbuild-os73gm1h.authentication.eu10.hana.ondemand.com/oauth/token
-          # ---- Secrets (configured in GitHub > Settings > Secrets) ----------
-          SAP_AICORE_CLIENT_ID: ${{ secrets.SAP_AICORE_CLIENT_ID }}
-          SAP_AICORE_CLIENT_SECRET: ${{ secrets.SAP_AICORE_CLIENT_SECRET }}
-          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          NEON_DB_URL: ${{ secrets.NEON_DB_URL }}
-          XSUAA_PUBLIC_KEY: ${{ secrets.XSUAA_PUBLIC_KEY }}
-        run: |
-          for var in \
-            LLM_PROVIDER SAP_AICORE_URL SAP_AICORE_AUTH_URL SAP_AICORE_MODEL_ID \
-            SAP_AICORE_DEPLOYMENT_ID SAP_AICORE_RESOURCE_GROUP \
-            SAP_AICORE_EMBEDDING_DEPLOYMENT_ID EMBEDDING_MODEL \
-            APP_NAME APP_VERSION DEBUG LOG_LEVEL JWT_ALGORITHM ALLOWED_ORIGINS \
-            ENABLE_CONVERSATION_MEMORY ENABLE_MULTI_AGENT_ORCHESTRATION XSUAA_ISSUER \
-            SAP_AICORE_CLIENT_ID SAP_AICORE_CLIENT_SECRET JWT_SECRET_KEY \
-            NEON_DB_URL XSUAA_PUBLIC_KEY; do
-            cf set-env btp-copilot-backend "$var" "${!var}"
-          done
-
-      - name: Start app
-        run: cf start btp-copilot-backend
+      - name: Deploy (cf push)
+        run: cf push -f manifest.yml
 
       - name: Logout
         if: always()
