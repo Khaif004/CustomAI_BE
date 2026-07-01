@@ -95,6 +95,21 @@ class GlobalChatAgent:
                 out.append(SystemMessage(content=content))
         return out
 
+    @staticmethod
+    def _apply_prepared_context(message: str, prepared_context: Optional[str]) -> str:
+        """Prepend the new pipeline's prepared context to the user turn.
+
+        GlobalChatAgent has no internal retrieval to skip, so injection is the only
+        change. None/"" => message unchanged (and prepending to the message survives
+        history truncation, unlike a leading system message).
+        """
+        if not prepared_context:
+            return message
+        return (
+            "Use the following retrieved context to answer the question:\n\n"
+            f"{prepared_context}\n\n---\n\n{message}"
+        )
+
     # ── SAP AI Core call ─────────────────────────────────────────────────────
 
     async def _sap_call(self, message: str, history: Optional[List[Dict]]) -> Dict[str, Any]:
@@ -111,10 +126,10 @@ class GlobalChatAgent:
         # Orchestration service format — same for all models.
         template_messages = [{"role": "system", "content": GLOBAL_SYSTEM_PROMPT}]
         for msg in (history or [])[-10:]:
-            template_messages.append({
-                "role": msg.get("role", "user"),
-                "content": msg.get("content", ""),
-            })
+            content = msg.get("content", "")
+            if not content:
+                continue
+            template_messages.append({"role": msg.get("role", "user"), "content": content})
         template_messages.append({"role": "user", "content": "{{?user_query}}"})
         payload = {
             "orchestration_config": {
@@ -179,6 +194,8 @@ class GlobalChatAgent:
         if self._mode == "mock":
             return {"response": f"[Mock] {message}", "model": "mock", "response_time": 0.0}
 
+        message = self._apply_prepared_context(message, _kwargs.get("prepared_context"))
+
         if self._mode == "sap":
             return await self._sap_call(message, history)
 
@@ -205,6 +222,8 @@ class GlobalChatAgent:
         if self._mode == "mock":
             yield f"[Mock] {message}"
             return
+
+        message = self._apply_prepared_context(message, _kwargs.get("prepared_context"))
 
         if self._mode == "sap":
             result = await self._sap_call(message, history)

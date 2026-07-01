@@ -2,15 +2,17 @@
 
 Routing logic
 ─────────────
-  No app_id AND no fiori_context  →  GlobalChatAgent   (general-purpose)
-  app_id OR  fiori_context        →  AppContextAgent   (schema / OData-aware)
+  No app_id AND no fiori_context               →  GlobalChatAgent    (general-purpose)
+  app_id present AND navigation intent         →  NavigationAgent    (rule-based, no LLM)
+  app_id OR fiori_context (all other queries)  →  AppContextAgent    (schema / OData-aware)
 
-Adding more agents in the future is straightforward: add a new agent to __init__
-and extend _pick_agent() with the new routing condition.
+Adding more agents: add the instance to __init__ and extend _pick_agent().
 """
 
 import logging
 from typing import Any, Dict, List, Optional
+
+from app.agents.navigation_agent import NavigationAgent
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +22,10 @@ class AgentRouter:
 
     def __init__(self, global_agent, app_agent):
         self.global_agent = global_agent    # GlobalChatAgent — general purpose
-        self.app_agent = app_agent          # SAPAICoreAgent / ChatAgent — app-aware
+        self.app_agent    = app_agent       # SAPAICoreAgent / ChatAgent — app-aware
+        self.nav_agent    = NavigationAgent()
         logger.info(
-            "AgentRouter initialised  global=%s  app=%s",
+            "AgentRouter initialised  global=%s  app=%s  nav=NavigationAgent",
             type(global_agent).__name__,
             type(app_agent).__name__,
         )
@@ -34,8 +37,18 @@ class AgentRouter:
         """Return True when the request carries an embedded-app context."""
         return bool(app_id) or bool(fiori_context)
 
-    def _pick_agent(self, app_id: Optional[str], fiori_context: Optional[Dict]):
+    def _pick_agent(
+        self,
+        message: str,
+        app_id: Optional[str],
+        fiori_context: Optional[Dict],
+    ):
         if self._is_app_context(app_id, fiori_context):
+            # Navigation intents that carry a real app_id go to the NavigationAgent
+            # (no LLM needed — rule-based extraction is fast and reliable).
+            if app_id and NavigationAgent.is_navigation_intent(message):
+                logger.debug("Routing → NavigationAgent (app_id=%s msg=%r)", app_id, message[:60])
+                return self.nav_agent
             logger.debug("Routing → AppContextAgent (app_id=%s)", app_id)
             return self.app_agent
         logger.debug("Routing → GlobalChatAgent")
@@ -53,8 +66,9 @@ class AgentRouter:
         user_id: Optional[str] = None,
         raw_message: Optional[str] = None,
         backend_url: Optional[str] = None,
+        prepared_context: Optional[str] = None,
     ) -> Dict[str, Any]:
-        agent = self._pick_agent(app_id, fiori_context)
+        agent = self._pick_agent(message, app_id, fiori_context)
         return await agent.get_response(
             message=message,
             history=history,
@@ -64,6 +78,7 @@ class AgentRouter:
             user_id=user_id,
             raw_message=raw_message,
             backend_url=backend_url,
+            prepared_context=prepared_context,
         )
 
     async def stream_response(
@@ -76,8 +91,9 @@ class AgentRouter:
         user_id: Optional[str] = None,
         raw_message: Optional[str] = None,
         backend_url: Optional[str] = None,
+        prepared_context: Optional[str] = None,
     ):
-        agent = self._pick_agent(app_id, fiori_context)
+        agent = self._pick_agent(message, app_id, fiori_context)
         async for chunk in agent.stream_response(
             message=message,
             history=history,
@@ -87,6 +103,7 @@ class AgentRouter:
             user_id=user_id,
             raw_message=raw_message,
             backend_url=backend_url,
+            prepared_context=prepared_context,
         ):
             yield chunk
 

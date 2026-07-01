@@ -148,9 +148,15 @@ When including links:
         try:
             logger.info(f"Processing request #{self.total_requests}: {message[:50]}...")
 
-            rag_context = await self._fetch_rag_context(message, app_id)
-            live_data = await self._fetch_live_odata_counts(message, fiori_context, odata_token)
-            system_prompt = self._build_system_prompt(rag_context, app_id, live_data)
+            # When the new context pipeline supplies prepared_context, use it and
+            # SKIP this agent's own retrieval. None => unchanged legacy behavior.
+            prepared_context = _kwargs.get("prepared_context")
+            if prepared_context is not None:
+                system_prompt = self._build_system_prompt(prepared_context, app_id, None)
+            else:
+                rag_context = await self._fetch_rag_context(message, app_id)
+                live_data = await self._fetch_live_odata_counts(message, fiori_context, odata_token)
+                system_prompt = self._build_system_prompt(rag_context, app_id, live_data)
             formatted_history = self._format_history(history)
 
             response = await self.chain.ainvoke({
@@ -187,9 +193,15 @@ When including links:
         self.last_request_time = time.time()
 
         try:
-            rag_context = await self._fetch_rag_context(message, app_id)
-            live_data = await self._fetch_live_odata_counts(message, fiori_context, odata_token)
-            system_prompt = self._build_system_prompt(rag_context, app_id, live_data)
+            # When the new context pipeline supplies prepared_context, use it and
+            # SKIP this agent's own retrieval. None => unchanged legacy behavior.
+            prepared_context = _kwargs.get("prepared_context")
+            if prepared_context is not None:
+                system_prompt = self._build_system_prompt(prepared_context, app_id, None)
+            else:
+                rag_context = await self._fetch_rag_context(message, app_id)
+                live_data = await self._fetch_live_odata_counts(message, fiori_context, odata_token)
+                system_prompt = self._build_system_prompt(rag_context, app_id, live_data)
             formatted_history = self._format_history(history)
 
             async for chunk in self.chain.astream({

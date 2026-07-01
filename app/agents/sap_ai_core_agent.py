@@ -2490,18 +2490,22 @@ class SAPAICoreAgent:
         user_id: Optional[str] = None,
         raw_message: Optional[str] = None,
         backend_url: Optional[str] = None,
+        prepared_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.request_count += 1
         start_time = datetime.utcnow()
 
-        rag_context = await self._fetch_rag_context(message, app_id)
+        # When the new context pipeline supplies prepared_context, skip ALL internal
+        # retrieval (RAG, LLM planner, live OData) and use it as the context. The SAP
+        # AI Core call below is unchanged. None => unchanged legacy behavior.
+        rag_context = None if prepared_context is not None else await self._fetch_rag_context(message, app_id)
         system_message = self._build_system_message(rag_context, app_id, fiori_context, user_id)
 
         _match_msg = raw_message if raw_message else message
 
         # Build entity list for the planner from the service tool registry
         _plan_entities: list = []
-        if app_id:
+        if app_id and prepared_context is None:
             try:
                 from app.api.apps import _service_tool_registry
                 for _svc in _service_tool_registry.get(app_id, []):
@@ -2511,6 +2515,9 @@ class SAPAICoreAgent:
                 pass
 
         live_data_block: Optional[str] = None
+        if prepared_context is not None:
+            # External context replaces all internal retrieval; "" => no block.
+            live_data_block = prepared_context or None
 
         if _plan_entities:
             _fetch_plan = await self._llm_plan_fetch(_match_msg, _plan_entities, fiori_context, app_id=app_id)
@@ -2809,7 +2816,7 @@ class SAPAICoreAgent:
 
 
         _planner_ran = bool(_fetch_plan)
-        if not live_data_block and not _planner_ran:
+        if prepared_context is None and not live_data_block and not _planner_ran:
             live_data_block = await self._fetch_real_data(
                 fiori_context, odata_token, _match_msg,
                 user_id, app_id,
@@ -2834,7 +2841,10 @@ class SAPAICoreAgent:
         template_messages = [{"role": "system", "content": system_message}]
         if history:
             for msg in history[-10:]:
-                template_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+                content = msg.get("content", "")
+                if not content:
+                    continue
+                template_messages.append({"role": msg.get("role", "user"), "content": content})
         template_messages.append({"role": "user", "content": "{{?user_query}}"})
 
         payload = {
@@ -2906,6 +2916,7 @@ class SAPAICoreAgent:
         user_id: Optional[str] = None,
         raw_message: Optional[str] = None,
         backend_url: Optional[str] = None,
+        prepared_context: Optional[str] = None,
     ):
         """Stream response token-by-token using word-level chunking."""
         result = await self.get_response(
@@ -2917,6 +2928,7 @@ class SAPAICoreAgent:
             user_id=user_id,
             raw_message=raw_message,
             backend_url=backend_url,
+            prepared_context=prepared_context,
         )
         text = result.get("response", "")
         words = text.split(" ")
