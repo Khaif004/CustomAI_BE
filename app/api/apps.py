@@ -357,11 +357,43 @@ async def odata_proxy(
 
 
 # ── Service Tool Registry ──────────────────────────────────────────────────────
-# In-memory map: app_id → List[{ app_name, app_base_url, service_url, entities, registered_at }]
-# Persisted to Neon PostgreSQL so restarts don't lose registrations.
-# CAP apps re-register on every startup anyway, but this covers the gap
-# between backend restart and the first CAP app health-check.
-_service_tool_registry: Dict[str, List[Dict[str, Any]]] = {}
+# Lazy in-memory map: app_id → List[{ app_name, app_base_url, service_url, entities, ... }]
+# On the first .get(app_id) or [app_id] access for an unknown app_id the registry
+# queries Neon for that single app — no bulk load on startup.  CAP apps that
+# re-register on their own startup go through the normal register endpoint and
+# populate the dict directly, so they are already "warm" by the time the first
+# user request arrives.
+
+class _LazyServiceRegistry(dict):
+    """dict subclass that lazy-loads a single app from Neon on first access.
+
+    All existing code that calls  _service_tool_registry.get(app_id, [])  or
+    _service_tool_registry[app_id]  automatically gets on-demand loading with
+    zero changes to any agent or retriever file.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._checked: set = set()   # app_ids already queried from DB (found or not)
+
+    def _ensure_loaded(self, app_id: str) -> None:
+        if super().__contains__(app_id) or app_id in self._checked:
+            return
+        self._checked.add(app_id)
+        _load_app_from_db(app_id)
+
+    def get(self, app_id, default=None):           # type: ignore[override]
+        if isinstance(app_id, str) and app_id:
+            self._ensure_loaded(app_id)
+        return super().get(app_id, default)
+
+    def __getitem__(self, app_id):
+        if isinstance(app_id, str) and app_id:
+            self._ensure_loaded(app_id)
+        return super().__getitem__(app_id)
+
+
+_service_tool_registry: _LazyServiceRegistry = _LazyServiceRegistry()
 
 
 def _neon_conn():
@@ -386,16 +418,19 @@ def _persist_service_tool(app_id: str, entry: Dict[str, Any]) -> None:
     try:
         with conn:
             with conn.cursor() as cur:
-                # Upsert application
+                # Upsert application (also persist base_url for executor)
+                _app_base_url = entry.get("app_base_url") or None
                 cur.execute(
                     """
-                    INSERT INTO applications (application_key, name)
-                    VALUES (%s, %s)
+                    INSERT INTO applications (application_key, name, base_url)
+                    VALUES (%s, %s, %s)
                     ON CONFLICT (application_key) DO UPDATE
-                        SET name = EXCLUDED.name, updated_at = NOW()
+                        SET name     = EXCLUDED.name,
+                            base_url = COALESCE(EXCLUDED.base_url, applications.base_url),
+                            updated_at = NOW()
                     RETURNING id
                     """,
-                    (app_id, entry.get("app_name", app_id)),
+                    (app_id, entry.get("app_name", app_id), _app_base_url),
                 )
                 app_uuid = str(cur.fetchone()[0])
 
@@ -543,9 +578,98 @@ def _persist_service_tool(app_id: str, entry: Dict[str, Any]) -> None:
         conn.close()
 
 
+def _load_app_from_db(app_id: str) -> None:
+    """Lazy-load a single app's service registrations from Neon into the registry.
+    Called automatically by _LazyServiceRegistry on first access for an unknown app_id.
+    """
+    import json as _json
+    conn = _neon_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.application_key, a.name,
+                       s.id, s.service_url, s.service_namespace, s.created_at
+                FROM applications a
+                JOIN services s ON s.application_id = a.id
+                WHERE a.application_key = %s
+                ORDER BY s.created_at
+                """,
+                (app_id,),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return
+
+            for app_key, app_name, svc_id, svc_url, base_url, reg_at in rows:
+                cur.execute(
+                    "SELECT entity_name, entity_fields FROM entities WHERE service_id = %s",
+                    (svc_id,),
+                )
+                ent_rows = cur.fetchall()
+                entities = [r[0] for r in ent_rows]
+                entity_fields: Dict[str, list] = {}
+                for ent_name, ent_flds_raw in ent_rows:
+                    try:
+                        flds = _json.loads(ent_flds_raw) if isinstance(ent_flds_raw, str) else (ent_flds_raw or [])
+                    except Exception:
+                        flds = []
+                    if flds:
+                        entity_fields[ent_name] = flds
+
+                cur.execute(
+                    """
+                    SELECT ea.alias, e.entity_name
+                    FROM entity_aliases ea
+                    JOIN entities e ON e.id = ea.entity_id
+                    WHERE e.service_id = %s
+                    """,
+                    (svc_id,),
+                )
+                aliases: Dict[str, str] = {row[0]: row[1] for row in cur.fetchall()}
+
+                cur.execute(
+                    """
+                    SELECT source_entity_name, target_entity_name, fk_field, is_integer_key
+                    FROM entity_associations
+                    WHERE source_service_id = %s
+                    """,
+                    (svc_id,),
+                )
+                associations = [
+                    {"source": r[0], "target": r[1], "fk_field": r[2], "is_integer_key": r[3]}
+                    for r in cur.fetchall()
+                ]
+
+                entry = {
+                    "app_name": app_name or app_key,
+                    "service_url": svc_url or "",
+                    "entities": entities,
+                    "entity_fields": entity_fields,
+                    "entity_aliases": aliases,
+                    "entity_associations": associations,
+                    "app_base_url": base_url or "",
+                    "registered_at": reg_at.isoformat() if reg_at else "",
+                }
+
+                # Use dict.setdefault directly (bypass lazy __getitem__) to avoid recursion.
+                services = dict.setdefault(_service_tool_registry, app_key, [])
+                if not any(s.get("service_url") == svc_url for s in services):
+                    services.append(entry)
+
+            logger.info(f"[registry] Lazy-loaded app '{app_id}' from Neon DB.")
+    except Exception as e:
+        logger.warning(f"[registry] Could not lazy-load app '{app_id}' from DB: {e}")
+    finally:
+        conn.close()
+
+
 def load_service_registry_from_db() -> None:
     """
-    Populate _service_tool_registry from Neon PostgreSQL on startup.
+    Bulk-populate _service_tool_registry from Neon PostgreSQL (all apps at once).
+    Kept for manual warm-up; no longer called on startup.
     Safe to call multiple times — in-memory entries already present are kept.
     """
     conn = _neon_conn()
