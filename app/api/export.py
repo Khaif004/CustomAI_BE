@@ -71,6 +71,30 @@ async def prepare_export(request: PrepareExportRequest):
     )
 
 
+@router.get("/{key}/view")
+async def view_raw_file(key: str):
+    """Serve a raw binary file (e.g. a rendered PDF) inline in the browser.
+
+    Keys are created by ExportStore.put_raw() and expire after 30 minutes.
+    Uses Content-Disposition: inline so the browser renders it (e.g. in an iframe)
+    rather than downloading it.
+    """
+    entry = ExportStore.get_raw(key)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File link has expired or is invalid (30-minute TTL). Re-run the action to get a fresh link.",
+        )
+    return Response(
+        content=entry["raw"],
+        media_type=entry["mime_type"],
+        headers={
+            "Content-Disposition": f'inline; filename="{entry["filename"]}"',
+            "Cache-Control": "private, max-age=1800",
+        },
+    )
+
+
 @router.get("/{key}/{fmt}")
 async def download_export(key: str, fmt: str):
     """
