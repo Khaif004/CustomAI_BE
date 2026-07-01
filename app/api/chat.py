@@ -155,6 +155,322 @@ async def _classify_doc_intent(message: str) -> str | None:
         logger.warning(f"LLM doc-intent classification failed: {ex}")
         return None
 
+# ── Tool-call injection + detection ──────────────────────────────────────────
+# When an app_id is present, registered tools are listed and a compact
+# instruction block is prepended to the message. If the LLM decides to execute
+# one it appends the exact JSON marker below. The streaming loop strips the
+# marker before forwarding chunks and emits a tool_call SSE event instead.
+
+_TOOL_CALL_MARKER = '{"__btp_tool_call__"'
+
+
+def _try_extract_tool_call(text: str) -> Optional[dict]:
+    """Parse a complete __btp_tool_call__ JSON object from the start of *text*.
+
+    Returns the inner dict (tool_key, entity_key, parameters, confidence) on
+    success, or None if the JSON is incomplete / malformed.
+    """
+    if not text.startswith(_TOOL_CALL_MARKER):
+        return None
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(text[:i + 1])
+                    return parsed.get('__btp_tool_call__') or None
+                except Exception:
+                    return None
+    return None  # incomplete JSON — keep buffering
+
+
+async def _load_app_tools(app_id: Optional[str]) -> list:
+    """Fetch registered tools for *app_id* (best-effort, returns [] on failure)."""
+    if not app_id:
+        return []
+    try:
+        from app.db.session import get_optional_db
+        from app.services.tool_catalog_service import list_tools
+        _agen = get_optional_db()
+        _sess = await _agen.__anext__()
+        try:
+            return await list_tools(_sess, app_id)
+        finally:
+            await _agen.aclose()
+    except Exception:
+        return []
+
+
+def _build_tool_call_context(tools: list) -> str:
+    """Build the system instruction block injected before the user message.
+
+    Keeps the block compact so it doesn't crowd the context window.
+    """
+    if not tools:
+        return ""
+    lines = [
+        "[REGISTERED TOOLS — use when the user wants to execute an action or function]",
+    ]
+    for t in tools:
+        tt = t.tool_type.value if hasattr(t.tool_type, 'value') else str(t.tool_type)
+        bind = (t.binding.value if t.binding and hasattr(t.binding, 'value') else (t.binding or 'unbound'))
+        label = t.display_name or t.name or t.tool_key
+        if t.parameters:
+            pstr = ", ".join(
+                f"{p.name}({'req' if p.required else 'opt'})"
+                for p in t.parameters
+            )
+            lines.append(f"  • {t.tool_key} ({tt}, {bind}): {label} | params: {pstr}")
+        else:
+            lines.append(f"  • {t.tool_key} ({tt}, {bind}): {label}")
+    lines += [
+        "",
+        "When the user's intent matches a tool, end your COMPLETE response with this JSON on its own line:",
+        '{"__btp_tool_call__": {"tool_key": "TheKey", "entity_key": "ID_OR_OMIT", "parameters": {}, "confidence": 0.95}}',
+        "Rules: set entity_key only for bound operations; include only parameters explicitly stated by the user; omit entity_key for unbound tools.",
+        "[END REGISTERED TOOLS]",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _format_exec_result(
+    display_name: str,
+    entity_key: Optional[str],
+    result_data: object,
+    messages: list,
+) -> str:
+    """Build a rich, client-facing confirmation for the chat bubble."""
+
+    def _cap_words(s: str) -> str:
+        """Capitalize the first letter of each word, leave the rest intact (preserves acronyms)."""
+        return " ".join(w[:1].upper() + w[1:] for w in s.split() if w)
+
+    # Readable action label: "FertilizerBlendService.FertilizerBlend.renderPDF" → "Render PDF"
+    raw_action = display_name.split(".")[-1] if "." in display_name else display_name
+    action_label = _cap_words(re.sub(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', raw_action).strip())
+
+    # Primary reference fields — checked in order, first non-empty match is the headline number
+    _PRIMARY = [
+        "orderID", "OrderID", "orderNo", "formulaID", "formulationID",
+        "ManufacturingOrder", "ProductionOrder", "ProcessOrder", "OrderNumber",
+        "SalesOrder", "PurchaseOrder", "DeliveryOrder", "DeliveryDocument",
+        "BillOfMaterial", "DocumentNumber", "InspectionLot", "Notification",
+        "ID", "id",
+    ]
+
+    # Fields never shown (binary blobs, OData metadata, draft flags)
+    _SKIP = {
+        "fileContent", "@odata.context", "@odata.etag", "@odata.metadataEtag",
+        "IsActiveEntity", "HasActiveEntity", "HasDraftEntity",
+    }
+
+    def _camel_label(s: str) -> str:
+        """Convert camelCase/PascalCase to readable label, preserving acronyms.
+        "orderID" → "Order ID",  "ManufacturingOrder" → "Manufacturing Order"
+        """
+        s = re.sub(r'(?<=[a-z])([A-Z])', r' \1', s)       # lowercase→UPPER boundary
+        s = re.sub(r'(?<=[A-Z])([A-Z][a-z])', r' \1', s)  # UPPER→Upper boundary (acronyms)
+        return _cap_words(s.strip())
+
+    ref_label: str | None = None
+    ref_value: str | None = None
+    extra_fields: list = []
+
+    if isinstance(result_data, dict):
+        for key in _PRIMARY:
+            val = result_data.get(key)
+            if val and str(val) not in ("", "None", "null", "0", "false"):
+                ref_label = _camel_label(key)
+                ref_value = str(val)
+                break
+
+        for k, v in result_data.items():
+            if k in _SKIP or k == (ref_label or ""):
+                continue
+            if isinstance(v, (dict, list)) or v is None:
+                continue
+            sv = str(v)
+            if sv in ("", "None", "null") or len(sv) > 200:
+                continue
+            extra_fields.append((_camel_label(k), sv))
+            if len(extra_fields) >= 4:
+                break
+
+    lines: list[str] = []
+
+    if ref_label and ref_value and entity_key:
+        lines.append(f"**{ref_label} #{ref_value}** created for Blend **{entity_key}**.")
+    elif ref_label and ref_value:
+        lines.append(f"**{ref_label} #{ref_value}** created successfully.")
+    elif entity_key:
+        lines.append(f"**{action_label}** completed for Blend **{entity_key}**.")
+    else:
+        raw = (messages[0] if messages else "Completed successfully.").split(".")[0]
+        lines.append(f"**{action_label}** — {raw.strip()}.")
+
+    if extra_fields:
+        lines.append("")
+        for label, val in extra_fields:
+            lines.append(f"- **{label}**: {val}")
+
+    if messages:
+        lines.append("")
+        for msg in messages[:3]:
+            lines.append(f"> {msg.rstrip('.')}.")
+
+    return "\n\n" + "\n".join(lines)
+
+
+async def _execute_tool_inline(request, tool_call: dict):
+    """Execute a tool the LLM decided to call and stream status chunks + tool_result event.
+
+    Yields SSE strings directly so the caller can `yield` them into the stream.
+    All errors are caught — the stream is never broken.
+
+    Step pipeline (4 steps):
+      1. analyzing  — broadcast before any I/O so the UI animates immediately
+      2. found      — tool resolved from DB
+      3. preparing  — entity key assembled, request prepared
+      4. executing  — HTTP call in flight
+    """
+    if not request.app_id:
+        return
+
+    tool_key   = tool_call.get("tool_key", "")
+    entity_key = tool_call.get("entity_key") or None
+    parameters = tool_call.get("parameters") or {}
+
+    _TOTAL = 4  # total pipeline steps shown in the UI
+
+    def _status(step: str, step_num: int, **kwargs) -> str:
+        return f"data: {json.dumps({'type': 'exec_status', 'step': step, 'step_num': step_num, 'total_steps': _TOTAL, **kwargs})}\n\n"
+
+    def _chunk(text: str) -> str:
+        return f"data: {json.dumps({'type': 'chunk', 'content': text})}\n\n"
+
+    def _tool_result(data: dict) -> str:
+        return f"data: {json.dumps({'type': 'tool_result', **data})}\n\n"
+
+    # Step 1 — before any I/O so the animation panel appears immediately
+    yield _status("analyzing", 1)
+
+    odata_token  = request.odata_token or (request.fiori_context or {}).get("odata_token")
+    display_name = tool_key
+
+    try:
+        from app.db.session import get_optional_db
+        from app.services.tool_catalog_service import get_tool
+        from app.services.action_execution.executor import ActionExecutionService
+        from app.services.action_execution.models import ActionExecutionRequest
+
+        _agen    = get_optional_db()
+        _session = await _agen.__anext__()
+        try:
+            _tool_def = await get_tool(_session, request.app_id, tool_key)
+            if _tool_def is not None:
+                display_name = _tool_def.display_name or _tool_def.name or tool_key
+
+            # Step 2 — tool identified
+            yield _status("found", 2, tool=display_name)
+
+            # Step 3 — request prepared (entity key resolved)
+            entity_label = entity_key or "record"
+            yield _status("preparing", 3, entity=entity_label)
+
+            # Step 4 — HTTP call in flight
+            yield _status("executing", 4)
+
+            exec_req = ActionExecutionRequest(
+                app_id=request.app_id,
+                tool_key=tool_key,
+                parameters=parameters,
+                entity_key=entity_key,
+                odata_token=odata_token,
+            )
+            result = await ActionExecutionService().execute(exec_req, session=_session)
+        finally:
+            await _agen.aclose()
+
+        if result.success:
+            res_data = result.result if isinstance(result.result, dict) else {}
+            if res_data.get("executionType") == "UI_ACTION":
+                msg = f"{display_name} triggered."
+                yield _status("success", 4, message=msg)
+                yield _chunk(f"\n✅ {msg}")
+                yield _tool_result({
+                    "success":        True,
+                    "tool_key":       tool_key,
+                    "execution_type": "UI_ACTION",
+                    "frontend_event": res_data.get("frontendEvent"),
+                    "payload":        res_data.get("payload", {}),
+                })
+            elif res_data.get("fileContent"):
+                # Tool returned binary content (e.g. renderPDF via Adobe Lifecycle).
+                # Store it and return a viewable URL instead of dumping base64 into the chat.
+                import base64 as _b64
+                from app.services.export_store import ExportStore as _ES
+                from app.config import get_settings as _gs
+                _cfg = _gs()
+                _pdf_url: Optional[str] = None
+                try:
+                    _pdf_bytes = _b64.b64decode(res_data["fileContent"])
+                    _safe = re.sub(r'[^a-z0-9_]', '_', (display_name.split(".")[-1] or "file").lower())
+                    _key = _ES.put_raw(_pdf_bytes, "application/pdf", f"{_safe}_{entity_key or 'record'}.pdf")
+                    _base = (_cfg.backend_base_url or "http://localhost:8000").rstrip("/")
+                    _pdf_url = f"{_base}/api/export/{_key}/view"
+                except Exception as _e:
+                    logger.warning("[chat] PDF binary storage failed for %s: %s", tool_key, _e)
+
+                msgs  = result.messages or []
+                label = f"Blend **{entity_key}**" if entity_key else "the record"
+                if _pdf_url:
+                    yield _status("success", 4, message=f"PDF ready for {label.replace('**', '')}")
+                    yield _chunk(
+                        f"\n\nPDF generated for {label}.\n\n"
+                        f"[View PDF]({_pdf_url}) &nbsp;·&nbsp; [Download PDF]({_pdf_url})\n\n"
+                        f"_Link valid for 30 minutes._"
+                    )
+                    yield _tool_result({
+                        "success":  True,
+                        "tool_key": tool_key,
+                        "messages": msgs,
+                        "pdf_url":  _pdf_url,
+                    })
+                else:
+                    # PDF storage failed — fall back to generic message
+                    yield _status("success", 4, message="PDF generated.")
+                    yield _chunk(f"\n\nPDF generated for {label}. (Preview unavailable — binary storage failed.)")
+                    yield _tool_result({"success": True, "tool_key": tool_key, "messages": msgs})
+            else:
+                msgs    = result.messages or []
+                summary = msgs[0] if msgs else "Completed successfully."
+                rich_md = _format_exec_result(display_name, entity_key, result.result, msgs)
+                yield _status("success", 4, message=summary)
+                yield _chunk(rich_md)
+                yield _tool_result({
+                    "success":  True,
+                    "tool_key": tool_key,
+                    "messages": msgs,
+                    "result":   result.result,
+                })
+        else:
+            err = result.error.message if result.error else "Execution failed."
+            yield _status("error", 4, message=err)
+            yield _chunk(f"\n\n❌ **{display_name}** — {err}")
+            yield _tool_result({"success": False, "tool_key": tool_key, "error": err})
+
+    except Exception as exc:
+        logger.error("[chat] Inline tool execution error tool='%s': %s", tool_key, exc, exc_info=True)
+        err = str(exc)
+        yield _status("error", 4, message=err)
+        yield _chunk(f"\n\n❌ **{display_name}** failed: {err}")
+        yield _tool_result({"success": False, "tool_key": tool_key, "error": err})
+
+
 def _save_chat_to_db_sync(
     session_id: str,
     app_id: Optional[str],
@@ -518,6 +834,60 @@ except Exception as e:
     chat_agent = None
 
 
+# ── New context pipeline (feature-flagged) ────────────────────────────────────
+# When ENABLE_CONTEXT_PIPELINE is on, a chat turn's context is prepared by the
+# shared Planner → Retrieval Orchestrator → Context Builder pipeline and handed to
+# the existing agent as `prepared_context`. Default off = unchanged legacy flow.
+_CONTEXT_PIPELINE_ENABLED = getattr(settings, "enable_context_pipeline", False)
+
+
+async def _build_prepared_context(request: "ChatRequest", *, user_id, session_id):
+    """Run the shared context pipeline for one chat turn and return the prepared
+    context string for the agents.
+
+    Returns:
+      * None  — flag off, agent unavailable, or ANY failure → caller uses the
+                UNCHANGED legacy flow (agent does its own retrieval).
+      * str   — the rendered context ("" means the pipeline ran but found nothing;
+                agents then skip their own retrieval and inject no block).
+
+    NEVER raises: a pipeline problem must never break streaming or a chat turn.
+    Both the embedded-Fiori and Global chatbots go through this same function;
+    only the ConversationContext (built by the mapper) differs.
+    """
+    if not _CONTEXT_PIPELINE_ENABLED or chat_agent is None:
+        return None
+    try:
+        from app.db.session import get_optional_db
+        from app.services.chat_context.mapper import chat_request_to_conversation_context
+        from app.services.chat_context.pipeline import get_chat_pipeline
+
+        cc = chat_request_to_conversation_context(request, user_id=user_id, session_id=session_id)
+        # get_optional_db is an async-generator dependency; drive it manually because
+        # we are outside FastAPI's Depends machinery (inside event_generator).
+        _agen = get_optional_db()
+        _session = await _agen.__anext__()
+        try:
+            out = await get_chat_pipeline().run(cc, session=_session)
+        finally:
+            await _agen.aclose()
+        if out is None:
+            return None
+        logger.info(
+            "[chat.sap_ai_core_request] channel=%s app_id=%s intent=%s confidence=%.3f "
+            "retrievers=%s token_estimate=%d prepared_chars=%d pipeline_ms=%.1f",
+            cc.channel.value, cc.app_id, out.intent, out.confidence,
+            out.retrievers_used, out.token_estimate, len(out.prepared_context), out.total_ms,
+        )
+        return out.prepared_context
+    except Exception as e:
+        logger.error(
+            f"[chat.pipeline] context pipeline failed — falling back to legacy flow: {e}",
+            exc_info=True,
+        )
+        return None
+
+
 @router.post("/", response_model=ChatResponse, status_code=status.HTTP_200_OK)
 async def chat(request: ChatRequest, http_request: Request, current_user=Depends(get_current_user)) -> ChatResponse:
     """Send a message and get a response (requires auth)"""
@@ -538,6 +908,10 @@ async def chat(request: ChatRequest, http_request: Request, current_user=Depends
             history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
 
         _backend_url = str(http_request.base_url).rstrip("/")
+        # New pipeline (flag-gated). None => unchanged legacy flow.
+        prepared_context = await _build_prepared_context(
+            request, user_id=user_id, session_id=request.session_id,
+        )
         result = await chat_agent.get_response(
             message=request.message,
             history=history,
@@ -546,6 +920,7 @@ async def chat(request: ChatRequest, http_request: Request, current_user=Depends
             odata_token=getattr(request, 'odata_token', None),
             user_id=user_id,
             backend_url=_backend_url,
+            prepared_context=prepared_context,
         )
 
         return ChatResponse(
@@ -652,6 +1027,25 @@ async def chat_stream(request: ChatRequest, http_request: Request, current_user=
 
             else:
                 # ── Normal chat path ──────────────────────────────────────────────
+                # Inject tool-call instructions when an app_id is present.
+                if request.app_id:
+                    _app_tools = await _load_app_tools(request.app_id)
+                    _tool_ctx = _build_tool_call_context(_app_tools)
+                    if _tool_ctx:
+                        enriched_message = _tool_ctx + enriched_message
+
+                # New pipeline (flag-gated, runs ONCE before the stream loop). None =>
+                # legacy flow untouched; the agent does its own retrieval as before.
+                prepared_context = await _build_prepared_context(
+                    request, user_id=_user_id, session_id=_session_id,
+                )
+
+                # Lookahead buffer: hold back up to len(_TOOL_CALL_MARKER) chars so
+                # the JSON marker never leaks to the frontend as visible text.
+                _hold = ""
+                _tool_call_result: Optional[dict] = None
+                _LOOKAHEAD = len(_TOOL_CALL_MARKER)
+
                 if hasattr(chat_agent, 'stream_response'):
                     async for chunk in chat_agent.stream_response(
                         message=enriched_message,
@@ -662,9 +1056,29 @@ async def chat_stream(request: ChatRequest, http_request: Request, current_user=
                         user_id=_user_id,
                         raw_message=request.message,
                         backend_url=_backend_url,
+                        prepared_context=prepared_context,
                     ):
                         _response_buffer.append(chunk)
-                        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                        _hold += chunk
+
+                        marker_pos = _hold.find(_TOOL_CALL_MARKER)
+                        if marker_pos >= 0:
+                            # Emit everything before the marker
+                            if marker_pos > 0:
+                                yield f"data: {json.dumps({'type': 'chunk', 'content': _hold[:marker_pos]})}\n\n"
+                            tail = _hold[marker_pos:]
+                            tc = _try_extract_tool_call(tail)
+                            if tc is not None:
+                                _tool_call_result = tc
+                                _hold = ""
+                            else:
+                                _hold = tail  # incomplete JSON — keep buffering
+                        else:
+                            # Emit bytes more than LOOKAHEAD chars old (safe zone)
+                            safe = len(_hold) - _LOOKAHEAD
+                            if safe > 0:
+                                yield f"data: {json.dumps({'type': 'chunk', 'content': _hold[:safe]})}\n\n"
+                                _hold = _hold[safe:]
                 else:
                     result = await chat_agent.get_response(
                         message=enriched_message,
@@ -675,15 +1089,53 @@ async def chat_stream(request: ChatRequest, http_request: Request, current_user=
                         user_id=_user_id,
                         raw_message=request.message,
                         backend_url=_backend_url,
+                        prepared_context=prepared_context,
                     )
                     words = result["response"].split(" ")
                     for i, word in enumerate(words):
                         chunk = word if i == 0 else ' ' + word
                         _response_buffer.append(chunk)
-                        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                        _hold += chunk
                         await asyncio.sleep(0.03)
+                    # For non-streaming path: detect tool_call in accumulated hold buffer
+                    marker_pos = _hold.find(_TOOL_CALL_MARKER)
+                    if marker_pos >= 0:
+                        if marker_pos > 0:
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': _hold[:marker_pos]})}\n\n"
+                        tc = _try_extract_tool_call(_hold[marker_pos:])
+                        if tc is not None:
+                            _tool_call_result = tc
+                            _hold = ""
+                    else:
+                        if _hold:
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': _hold})}\n\n"
+                            _hold = ""
+
+                # Emit any remaining non-tool-call text still in the hold buffer
+                if _hold and not _tool_call_result:
+                    marker_pos = _hold.find(_TOOL_CALL_MARKER)
+                    if marker_pos > 0:
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': _hold[:marker_pos]})}\n\n"
+                    elif marker_pos < 0:
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': _hold})}\n\n"
+
+                # Execute the tool the LLM decided to call, streaming status inline.
+                # For apps without an app_id, fall back to the raw tool_call event.
+                if _tool_call_result:
+                    if request.app_id:
+                        async for _ev in _execute_tool_inline(request, _tool_call_result):
+                            yield _ev
+                    else:
+                        yield f"data: {json.dumps({'type': 'tool_call', **_tool_call_result})}\n\n"
 
                 response_time = time.time() - start_time
+                if prepared_context is not None:
+                    logger.info(
+                        "[chat.streaming_complete] session_id=%s app_id=%s chunks=%d "
+                        "response_time=%.2f model=%s pipeline=on",
+                        _session_id, request.app_id, len(_response_buffer),
+                        response_time, model_name,
+                    )
                 yield f"data: {json.dumps({'type': 'done', 'model': model_name, 'response_time': round(response_time, 2), 'session_id': _session_id})}\n\n"
 
                 # ── Persist session + messages to Neon DB (best-effort, non-blocking) ─
