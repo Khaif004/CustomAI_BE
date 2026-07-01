@@ -75,40 +75,37 @@ class Settings(BaseSettings):
             return None
         return self.xsuaa_public_key.replace('\\n', '\n')
 
-    allowed_origins: str = "http://localhost:3000,http://localhost:5173"
+    allowed_origins: str = "http://localhost:3000,http://localhost:5173,http://localhost:4004"
 
     @property
     def cors_origins(self) -> List[str]:
         return [origin.strip() for origin in self.allowed_origins.split(",")]
 
-    database_url: Optional[str] = None
-    # Neon.tech PostgreSQL connection string for pgvector (schema/embeddings storage)
-    # Set via NEON_DB_URL in .env — required when vector_store_type = "pgvector"
     neon_db_url: Optional[str] = None
-    db_host: Optional[str] = None
-    db_port: int = 5432
-    db_user: Optional[str] = None
-    db_password: Optional[str] = None
-    db_name: str = "joule_replacement"
 
     @property
-    def database_connection_string(self) -> str:
-        if self.database_url:
-            return self.database_url
-        if self.db_host and self.db_user and self.db_password:
-            return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
-        return "sqlite:///./data/joule_dev.db"
+    def async_database_url(self) -> Optional[str]:
+        """SQLAlchemy async URL for the Tool Registry's psycopg-v3 engine.
 
-    # HANA Cloud (optional)
-    hana_host: Optional[str] = None
-    hana_port: int = 443
-    hana_user: Optional[str] = None
-    hana_password: Optional[str] = None
-    hana_database: Optional[str] = None
+        Derived from ``neon_db_url`` by swapping the scheme to
+        ``postgresql+psycopg://`` (psycopg v3 async). The raw ``neon_db_url`` is
+        left untouched so the existing sync psycopg2 code keeps using it verbatim.
+        psycopg v3 forwards libpq params (sslmode, channel_binding) to libpq, so
+        the Neon pooler URL works as-is — no query-string surgery needed.
+        Returns None when no Neon URL is configured (registry degrades gracefully).
+        """
+        raw = self.neon_db_url
+        if not raw:
+            return None
+        if raw.startswith("postgresql+"):  # already carries an explicit driver
+            return raw
+        if raw.startswith("postgresql://"):
+            return "postgresql+psycopg://" + raw[len("postgresql://"):]
+        if raw.startswith("postgres://"):
+            return "postgresql+psycopg://" + raw[len("postgres://"):]
+        return raw
 
     # Vector Store
-    vector_store_type: str = "pgvector"  # "pgvector" (Neon), "chroma", "faiss"
-    vector_store_path: str = "./data/vector_store"
     vector_store_collection: str = "joule_knowledge"
     embedding_model: str = "text-embedding-3-small"
 
@@ -116,10 +113,6 @@ class Settings(BaseSettings):
     knowledge_base_path: str = "./data/knowledge_base"
     knowledge_base_chunk_size: int = 1000
     knowledge_base_chunk_overlap: int = 200
-
-    # Agent
-    max_agent_iterations: int = 10
-    agent_timeout_seconds: int = 30
 
     # Live data display & export
     # Number of rows shown inline in the chat response.
@@ -141,12 +134,16 @@ class Settings(BaseSettings):
     query_cache_ttl_minutes: int = 30
 
     # Feature Flags
-    enable_conversation_memory: bool = True
-    enable_multi_agent_orchestration: bool = True
+    # When True, chat turns build their context via the new
+    # Planner → Retrieval Orchestrator → Context Builder pipeline before the LLM
+    # call. Default False = unchanged legacy flow (each agent does its own
+    # retrieval). Env: ENABLE_CONTEXT_PIPELINE.
+    enable_context_pipeline: bool = False
 
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
 
 
 @lru_cache()
