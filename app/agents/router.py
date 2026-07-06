@@ -42,12 +42,15 @@ class AgentRouter:
         message: str,
         app_id: Optional[str],
         fiori_context: Optional[Dict],
+        raw_message: Optional[str] = None,
     ):
         if self._is_app_context(app_id, fiori_context):
             # Navigation intents that carry a real app_id go to the NavigationAgent
             # (no LLM needed — rule-based extraction is fast and reliable).
-            if app_id and NavigationAgent.is_navigation_intent(message):
-                logger.debug("Routing → NavigationAgent (app_id=%s msg=%r)", app_id, message[:60])
+
+            intent_text = raw_message or message
+            if app_id and NavigationAgent.is_navigation_intent(intent_text):
+                logger.debug("Routing → NavigationAgent (app_id=%s msg=%r)", app_id, intent_text[:60])
                 return self.nav_agent
             logger.debug("Routing → AppContextAgent (app_id=%s)", app_id)
             return self.app_agent
@@ -68,7 +71,7 @@ class AgentRouter:
         backend_url: Optional[str] = None,
         prepared_context: Optional[str] = None,
     ) -> Dict[str, Any]:
-        agent = self._pick_agent(message, app_id, fiori_context)
+        agent = self._pick_agent(message, app_id, fiori_context, raw_message=raw_message)
         return await agent.get_response(
             message=message,
             history=history,
@@ -93,7 +96,7 @@ class AgentRouter:
         backend_url: Optional[str] = None,
         prepared_context: Optional[str] = None,
     ):
-        agent = self._pick_agent(message, app_id, fiori_context)
+        agent = self._pick_agent(message, app_id, fiori_context, raw_message=raw_message)
         async for chunk in agent.stream_response(
             message=message,
             history=history,
