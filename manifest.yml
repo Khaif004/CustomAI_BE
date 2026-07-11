@@ -5,7 +5,7 @@ applications:
     disk_quota: 2G
     buildpacks:
       - python_buildpack
-    command: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
     health-check-type: http
     health-check-http-endpoint: /health
     services:
