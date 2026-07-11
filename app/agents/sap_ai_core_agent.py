@@ -477,6 +477,7 @@ class SAPAICoreAgent:
         odata_filter: Optional[str],
         service_url: str,
         odata_token: Optional[str],
+        app_id: Optional[str] = None,
     ) -> list:
         """Fetch key field values from an entity with an optional filter.
 
@@ -502,6 +503,16 @@ class SAPAICoreAgent:
             headers["Authorization"] = (
                 f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
             )
+        elif app_id:
+            try:
+                from app.api.apps import _service_tool_registry
+                for _svc in _service_tool_registry.get(app_id, []):
+                    _sa = _svc.get("service_auth")
+                    if _sa and _sa.get("header"):
+                        headers["Authorization"] = _sa["header"]
+                        break
+            except Exception:
+                pass
 
         try:
             async with _aio.ClientSession() as session:
@@ -842,6 +853,16 @@ class SAPAICoreAgent:
                 headers["Authorization"] = (
                     f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
                 )
+            elif app_id:
+                try:
+                    from app.api.apps import _service_tool_registry
+                    for _svc in _service_tool_registry.get(app_id, []):
+                        _sa = _svc.get("service_auth")
+                        if _sa and _sa.get("header"):
+                            headers["Authorization"] = _sa["header"]
+                            break
+                except Exception:
+                    pass
             async with _aio.ClientSession() as session:
                 async with session.get(
                     url, headers=headers, timeout=_aio.ClientTimeout(total=8)
@@ -1984,6 +2005,13 @@ class SAPAICoreAgent:
                 user_filter = f"{owner_field} eq '{user_id}'"
                 odata_filter = f"{odata_filter} and {user_filter}" if odata_filter else user_filter
 
+        # ── Draft-entity guard: always request only active records ────────────
+        _is_draft_entity = fields and any(f.lower() == "isactiveentity" for f in fields)
+        if _is_draft_entity and (not odata_filter or "IsActiveEntity" not in odata_filter):
+            _active_clause = "IsActiveEntity eq true"
+            odata_filter = f"({odata_filter}) and {_active_clause}" if odata_filter else _active_clause
+            logger.info("[fetch_real_data] draft entity — appended IsActiveEntity eq true")
+
         # ── Row limits driven by settings (no hardcoding) ────────────────────
         try:
             from app.config.settings import get_settings as _gs
@@ -2049,6 +2077,32 @@ class SAPAICoreAgent:
                 headers["Authorization"] = (
                     f"Bearer {odata_token.replace('Bearer ', '').replace('bearer ', '')}"
                 )
+            elif app_id:
+                # No Fiori bearer token — fall back to service_auth (Basic Auth)
+                # registered by cap-plugin for mocked-auth / local-dev environments.
+                try:
+                    from app.api.apps import _service_tool_registry
+                    svcs = _service_tool_registry.get(app_id, [])
+                    for _svc in svcs:
+                        _sa = _svc.get("service_auth")
+                        if _sa and _sa.get("header"):
+                            headers["Authorization"] = _sa["header"]
+                            logger.info(
+                                "[fetch_real_data] using service_auth (user=%s) for %s",
+                                _sa.get("username"), service_url,
+                            )
+                            break
+                    if "Authorization" not in headers:
+                        logger.warning(
+                            "[fetch_real_data] ⚠ No service_auth found for app_id=%s "
+                            "(%d service(s) in registry, auth present: %s) — "
+                            "OData request will be anonymous → expect 403 on @requires services. "
+                            "Ensure cap-plugin v0.2.18+ is installed and cds watch was restarted.",
+                            app_id, len(svcs),
+                            [bool(s.get("service_auth")) for s in svcs],
+                        )
+                except Exception as _sa_err:
+                    logger.warning("[fetch_real_data] service_auth lookup error: %s", _sa_err)
 
             # aiohttp default urlencode uses quote_plus (spaces → '+'), but CAP's
             # OData parser only accepts %20.  Build query strings manually.
@@ -2774,7 +2828,7 @@ class SAPAICoreAgent:
 
                     _parent_ids = await self._fetch_key_values(
                         _parent_ent, _key_field, _parent_filter,
-                        _parent_svc_url, odata_token,
+                        _parent_svc_url, odata_token, app_id=app_id,
                     )
 
                     if not _parent_ids:

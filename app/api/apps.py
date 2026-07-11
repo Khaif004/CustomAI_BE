@@ -775,6 +775,10 @@ class ServiceToolRequest(BaseModel):
         None,
         description="Map of entity name → list of field names. Sent by cap-plugin so the agent can build OData $filter clauses without needing to parse RAG chunks.",
     )
+    service_auth: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Basic-auth credentials sent by cap-plugin for mocked-auth / local-dev apps so the backend can query OData without a Fiori bearer token.",
+    )
 
 
 class ServiceToolResponse(BaseModel):
@@ -803,6 +807,8 @@ async def register_service_tool(request: ServiceToolRequest):
         "entity_fields": request.entity_fields or {},
         "app_base_url": request.app_base_url or "",
         "registered_at": datetime.now(timezone.utc).isoformat(),
+        # Stored in-memory only (not persisted to DB) — refreshed on every CAP restart.
+        "service_auth": request.service_auth,
     }
 
     # Upsert: replace existing entry for this service_url, or append a new one.
